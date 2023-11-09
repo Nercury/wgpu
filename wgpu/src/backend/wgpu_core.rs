@@ -24,7 +24,7 @@ use std::{
 };
 use wgc::command::{bundle_ffi::*, compute_ffi::*, render_ffi::*};
 use wgc::device::DeviceLostClosure;
-use wgt::WasmNotSendSync;
+use wgt::{WasmNotSend, WasmNotSendSync, WasmNotSync};
 
 const LABEL: &str = "label";
 
@@ -254,6 +254,43 @@ impl ContextWgpuCore {
             description: self.format_error(&error),
             source: Box::new(error),
         });
+    }
+
+    fn try_handle_error(
+        &self,
+        sink_mutex: &Mutex<ErrorSinkRaw>,
+        cause: impl Error + WasmNotSend + WasmNotSync + 'static,
+        label_key: &'static str,
+        label: Label<'_>,
+        string: &'static str,
+    ) -> Option<String> {
+        let error = wgc::error::ContextError {
+            string,
+            cause: Box::new(cause),
+            label: label.unwrap_or_default().to_string(),
+            label_key,
+        };
+        let mut sink = sink_mutex.lock();
+        let mut source_opt: Option<&(dyn Error + 'static)> = Some(&error);
+        while let Some(source) = source_opt {
+            if let Some(wgc::device::DeviceError::OutOfMemory) =
+                source.downcast_ref::<wgc::device::DeviceError>()
+            {
+                sink.handle_error(crate::Error::OutOfMemory {
+                    source: Box::new(error),
+                });
+                return None;
+            }
+            source_opt = source.source();
+        }
+
+        Some(self.format_error(&error))
+
+        // // Otherwise, it is a validation error
+        // sink.handle_error(crate::Error::Validation {
+        //     description: self.format_error(&error),
+        //     source: Box::new(error),
+        // });
     }
 
     fn handle_error_nolabel(
@@ -861,6 +898,67 @@ impl crate::Context for ContextWgpuCore {
             );
         }
         (id, ())
+    }
+
+    #[cfg_attr(
+        not(any(
+            feature = "spirv",
+            feature = "glsl",
+            feature = "wgsl",
+            feature = "naga-ir"
+        )),
+        allow(unreachable_code, unused_variables)
+    )]
+    fn device_try_create_shader_module(
+        &self,
+        device: &Self::DeviceId,
+        device_data: &Self::DeviceData,
+        desc: ShaderModuleDescriptor<'_>,
+        shader_bound_checks: wgt::ShaderBoundChecks,
+    ) -> Result<(Self::ShaderModuleId, Self::ShaderModuleData), String> {
+        let descriptor = wgc::pipeline::ShaderModuleDescriptor {
+            label: desc.label.map(Borrowed),
+            shader_bound_checks,
+        };
+        let source = match desc.source {
+            #[cfg(feature = "spirv")]
+            ShaderSource::SpirV(ref spv) => {
+                // Parse the given shader code and store its representation.
+                let options = naga::front::spv::Options {
+                    adjust_coordinate_space: false, // we require NDC_Y_UP feature
+                    strict_capabilities: true,
+                    block_ctx_dump_prefix: None,
+                };
+                wgc::pipeline::ShaderModuleSource::SpirV(Borrowed(spv), options)
+            }
+            #[cfg(feature = "glsl")]
+            ShaderSource::Glsl {
+                ref shader,
+                stage,
+                defines,
+            } => {
+                let options = naga::front::glsl::Options { stage, defines };
+                wgc::pipeline::ShaderModuleSource::Glsl(Borrowed(shader), options)
+            }
+            #[cfg(feature = "wgsl")]
+            ShaderSource::Wgsl(ref code) => wgc::pipeline::ShaderModuleSource::Wgsl(Borrowed(code)),
+            #[cfg(feature = "naga-ir")]
+            ShaderSource::Naga(module) => wgc::pipeline::ShaderModuleSource::Naga(module),
+            ShaderSource::Dummy(_) => panic!("found `ShaderSource::Dummy`"),
+        };
+        let (id, error) = wgc::gfx_select!(
+            device => self.0.device_create_shader_module(*device, &descriptor, source, None)
+        );
+        if let Some(cause) = error {
+            return Err(self.try_handle_error(
+                &device_data.error_sink,
+                cause,
+                LABEL,
+                desc.label,
+                "Device::create_shader_module",
+            ).expect("failed to retrieve error string"));
+        }
+        Ok((id, ()))
     }
 
     unsafe fn device_create_shader_module_spirv(

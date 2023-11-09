@@ -195,6 +195,13 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
         desc: ShaderModuleDescriptor<'_>,
         shader_bound_checks: wgt::ShaderBoundChecks,
     ) -> (Self::ShaderModuleId, Self::ShaderModuleData);
+    fn device_try_create_shader_module(
+        &self,
+        device: &Self::DeviceId,
+        device_data: &Self::DeviceData,
+        desc: ShaderModuleDescriptor<'_>,
+        shader_bound_checks: wgt::ShaderBoundChecks,
+    ) -> Result<(Self::ShaderModuleId, Self::ShaderModuleData), String>;
     unsafe fn device_create_shader_module_spirv(
         &self,
         device: &Self::DeviceId,
@@ -1221,6 +1228,13 @@ pub(crate) trait DynContext: Debug + WasmNotSendSync {
         desc: ShaderModuleDescriptor<'_>,
         shader_bound_checks: wgt::ShaderBoundChecks,
     ) -> (ObjectId, Box<crate::Data>);
+    fn device_try_create_shader_module(
+        &self,
+        device: &ObjectId,
+        device_data: &crate::Data,
+        desc: ShaderModuleDescriptor<'_>,
+        shader_bound_checks: wgt::ShaderBoundChecks,
+    ) -> Result<(ObjectId, Box<crate::Data>), String>;
     unsafe fn device_create_shader_module_spirv(
         &self,
         device: &ObjectId,
@@ -2196,6 +2210,25 @@ where
             shader_bound_checks,
         );
         (shader_module.into(), Box::new(data) as _)
+    }
+
+    fn device_try_create_shader_module(
+        &self,
+        device: &ObjectId,
+        device_data: &crate::Data,
+        desc: ShaderModuleDescriptor<'_>,
+        shader_bound_checks: wgt::ShaderBoundChecks,
+    ) -> Result<(ObjectId, Box<crate::Data>), String> {
+        let device = <T::DeviceId>::from(*device);
+        let device_data = downcast_ref(device_data);
+        let (shader_module, data) = Context::device_try_create_shader_module(
+            self,
+            &device,
+            device_data,
+            desc,
+            shader_bound_checks,
+        )?;
+        Ok((shader_module.into(), Box::new(data) as _))
     }
 
     unsafe fn device_create_shader_module_spirv(

@@ -2311,6 +2311,22 @@ impl Device {
         }
     }
 
+    /// Creates a shader module from either SPIR-V or WGSL source code.
+    pub fn try_create_shader_module(&self, desc: ShaderModuleDescriptor<'_>) -> Result<ShaderModule, String> {
+        let (id, data) = DynContext::device_try_create_shader_module(
+            &*self.context,
+            &self.id,
+            self.data.as_ref(),
+            desc,
+            wgt::ShaderBoundChecks::new(),
+        )?;
+        Ok(ShaderModule {
+            context: Arc::clone(&self.context),
+            id,
+            data,
+        })
+    }
+
     /// Creates a shader module from either SPIR-V or WGSL source code without runtime checks.
     ///
     /// # Safety
