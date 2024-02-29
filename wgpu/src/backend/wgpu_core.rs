@@ -25,7 +25,7 @@ use std::{
 use wgc::command::{bundle_ffi::*, compute_ffi::*, render_ffi::*};
 use wgc::device::DeviceLostClosure;
 use wgc::id::TypedId;
-use wgt::WasmNotSendSync;
+use wgt::{WasmNotSend, WasmNotSendSync, WasmNotSync};
 
 const LABEL: &str = "label";
 
