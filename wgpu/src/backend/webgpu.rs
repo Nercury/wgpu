@@ -16,10 +16,7 @@ use std::{
 };
 use wasm_bindgen::{prelude::*, JsCast};
 
-use crate::{
-    context::{downcast_ref, ObjectId, QueueWriteBuffer, Unused},
-    SurfaceTargetUnsafe, UncapturedErrorHandler,
-};
+use crate::{context::{downcast_ref, ObjectId, QueueWriteBuffer, Unused}, ShaderModuleDescriptor, SurfaceTargetUnsafe, UncapturedErrorHandler};
 
 fn create_identified<T>(value: T) -> (Identified<T>, Sendable<T>) {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1488,6 +1485,92 @@ impl crate::context::Context for ContextWebGpu {
             descriptor.label(label);
         }
         create_identified(device_data.0.create_shader_module(&descriptor))
+    }
+
+    fn device_try_create_shader_module(
+        &self,
+        device: &Self::DeviceId,
+        device_data: &Self::DeviceData,
+        desc: ShaderModuleDescriptor,
+        shader_bound_checks: wgt::ShaderBoundChecks,
+    ) -> Result<(Self::ShaderModuleId, Self::ShaderModuleData), String> {
+        let mut descriptor: web_sys::GpuShaderModuleDescriptor = match desc.source {
+            #[cfg(feature = "spirv")]
+            crate::ShaderSource::SpirV(ref spv) => {
+                use naga::{back, front, valid};
+
+                let options = naga::front::spv::Options {
+                    adjust_coordinate_space: false,
+                    strict_capabilities: true,
+                    block_ctx_dump_prefix: None,
+                };
+                let spv_parser = front::spv::Frontend::new(spv.iter().cloned(), &options);
+                let spv_module = spv_parser.parse().unwrap();
+
+                let mut validator = valid::Validator::new(
+                    valid::ValidationFlags::all(),
+                    valid::Capabilities::all(),
+                );
+                let spv_module_info = validator.validate(&spv_module).unwrap();
+
+                let writer_flags = naga::back::wgsl::WriterFlags::empty();
+                let wgsl_text =
+                    back::wgsl::write_string(&spv_module, &spv_module_info, writer_flags).unwrap();
+                web_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+            }
+            #[cfg(feature = "glsl")]
+            crate::ShaderSource::Glsl {
+                ref shader,
+                stage,
+                ref defines,
+            } => {
+                use naga::{back, front, valid};
+
+                // Parse the given shader code and store its representation.
+                let options = front::glsl::Options {
+                    stage,
+                    defines: defines.clone(),
+                };
+                let mut parser = front::glsl::Frontend::default();
+                let glsl_module = parser.parse(&options, shader).unwrap();
+
+                let mut validator = valid::Validator::new(
+                    valid::ValidationFlags::all(),
+                    valid::Capabilities::all(),
+                );
+                let glsl_module_info = validator.validate(&glsl_module).unwrap();
+
+                let writer_flags = naga::back::wgsl::WriterFlags::empty();
+                let wgsl_text =
+                    back::wgsl::write_string(&glsl_module, &glsl_module_info, writer_flags)
+                        .unwrap();
+                web_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+            }
+            #[cfg(feature = "wgsl")]
+            crate::ShaderSource::Wgsl(ref code) => web_sys::GpuShaderModuleDescriptor::new(code),
+            #[cfg(feature = "naga-ir")]
+            crate::ShaderSource::Naga(module) => {
+                use naga::{back, valid};
+
+                let mut validator = valid::Validator::new(
+                    valid::ValidationFlags::all(),
+                    valid::Capabilities::all(),
+                );
+                let module_info = validator.validate(&module).unwrap();
+
+                let writer_flags = naga::back::wgsl::WriterFlags::empty();
+                let wgsl_text =
+                    back::wgsl::write_string(&module, &module_info, writer_flags).unwrap();
+                web_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+            }
+            crate::ShaderSource::Dummy(_) => {
+                panic!("found `ShaderSource::Dummy`")
+            }
+        };
+        if let Some(label) = desc.label {
+            descriptor.label(label);
+        }
+        Ok(create_identified(device_data.0.create_shader_module(&descriptor)))
     }
 
     unsafe fn device_create_shader_module_spirv(
