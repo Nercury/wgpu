@@ -477,6 +477,7 @@ fn map_vertex_format(format: wgt::VertexFormat) -> webgpu_sys::GpuVertexFormat {
         VertexFormat::Sint32x2 => vf::Sint32x2,
         VertexFormat::Sint32x3 => vf::Sint32x3,
         VertexFormat::Sint32x4 => vf::Sint32x4,
+        VertexFormat::Unorm10_10_10_2 => vf::Unorm1010102,
         VertexFormat::Float64
         | VertexFormat::Float64x2
         | VertexFormat::Float64x3
@@ -733,6 +734,8 @@ fn map_wgt_limits(limits: webgpu_sys::GpuSupportedLimits) -> wgt::Limits {
         max_compute_workgroup_size_z: limits.max_compute_workgroup_size_z(),
         max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension(),
         // The following are not part of WebGPU
+        min_subgroup_size: wgt::Limits::default().min_subgroup_size,
+        max_subgroup_size: wgt::Limits::default().max_subgroup_size,
         max_push_constant_size: wgt::Limits::default().max_push_constant_size,
         max_non_sampler_bindings: wgt::Limits::default().max_non_sampler_bindings,
     }
@@ -1670,10 +1673,10 @@ impl crate::context::Context for ContextWebGpu {
                                 webgpu_sys::GpuStorageTextureAccess::WriteOnly
                             }
                             wgt::StorageTextureAccess::ReadOnly => {
-                                panic!("ReadOnly is not available")
+                                webgpu_sys::GpuStorageTextureAccess::ReadOnly
                             }
                             wgt::StorageTextureAccess::ReadWrite => {
-                                panic!("ReadWrite is not available")
+                                webgpu_sys::GpuStorageTextureAccess::ReadWrite
                             }
                         };
                         let mut storage_texture = webgpu_sys::GpuStorageTextureBindingLayout::new(
@@ -2040,6 +2043,11 @@ impl crate::context::Context for ContextWebGpu {
         create_identified(device_data.0.create_render_bundle_encoder(&mapped_desc))
     }
 
+    #[doc(hidden)]
+    fn device_make_invalid(&self, _device: &Self::DeviceId, _device_data: &Self::DeviceData) {
+        // Unimplemented
+    }
+
     fn device_drop(&self, _device: &Self::DeviceId, _device_data: &Self::DeviceData) {
         // Device is dropped automatically
     }
@@ -2066,10 +2074,23 @@ impl crate::context::Context for ContextWebGpu {
     fn device_set_device_lost_callback(
         &self,
         _device: &Self::DeviceId,
-        _device_data: &Self::DeviceData,
-        _device_lost_callback: crate::context::DeviceLostCallback,
+        device_data: &Self::DeviceData,
+        device_lost_callback: crate::context::DeviceLostCallback,
     ) {
-        unimplemented!();
+        use webgpu_sys::{GpuDeviceLostInfo, GpuDeviceLostReason};
+
+        let closure = Closure::once(move |info: JsValue| {
+            let info = info.dyn_into::<GpuDeviceLostInfo>().unwrap();
+            device_lost_callback(
+                match info.reason() {
+                    GpuDeviceLostReason::Destroyed => crate::DeviceLostReason::Destroyed,
+                    GpuDeviceLostReason::Unknown => crate::DeviceLostReason::Unknown,
+                    _ => crate::DeviceLostReason::Unknown,
+                },
+                info.message(),
+            );
+        });
+        let _ = device_data.0.lost().then(&closure);
     }
 
     fn device_poll(
@@ -2404,6 +2425,20 @@ impl crate::context::Context for ContextWebGpu {
         if let Some(label) = desc.label {
             mapped_desc.label(label);
         }
+
+        if let Some(ref timestamp_writes) = desc.timestamp_writes {
+            let query_set: &<ContextWebGpu as crate::Context>::QuerySetData =
+                downcast_ref(timestamp_writes.query_set.data.as_ref());
+            let mut writes = webgpu_sys::GpuComputePassTimestampWrites::new(&query_set.0);
+            if let Some(index) = timestamp_writes.beginning_of_pass_write_index {
+                writes.beginning_of_pass_write_index(index);
+            }
+            if let Some(index) = timestamp_writes.end_of_pass_write_index {
+                writes.end_of_pass_write_index(index);
+            }
+            mapped_desc.timestamp_writes(&writes);
+        }
+
         create_identified(
             encoder_data
                 .0
@@ -2501,6 +2536,19 @@ impl crate::context::Context for ContextWebGpu {
             }
             mapped_depth_stencil_attachment.stencil_read_only(dsa.stencil_ops.is_none());
             mapped_desc.depth_stencil_attachment(&mapped_depth_stencil_attachment);
+        }
+
+        if let Some(ref timestamp_writes) = desc.timestamp_writes {
+            let query_set: &<ContextWebGpu as crate::Context>::QuerySetData =
+                downcast_ref(timestamp_writes.query_set.data.as_ref());
+            let mut writes = webgpu_sys::GpuRenderPassTimestampWrites::new(&query_set.0);
+            if let Some(index) = timestamp_writes.beginning_of_pass_write_index {
+                writes.beginning_of_pass_write_index(index);
+            }
+            if let Some(index) = timestamp_writes.end_of_pass_write_index {
+                writes.end_of_pass_write_index(index);
+            }
+            mapped_desc.timestamp_writes(&writes);
         }
 
         create_identified(encoder_data.0.begin_render_pass(&mapped_desc))

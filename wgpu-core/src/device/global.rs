@@ -11,6 +11,7 @@ use crate::{
     id::{self, AdapterId, DeviceId, QueueId, SurfaceId},
     init_tracker::TextureInitTracker,
     instance::{self, Adapter, Surface},
+    lock::{rank, RwLock},
     pipeline, present,
     resource::{self, BufferAccessResult},
     resource::{BufferAccessError, BufferMapOperation, CreateBufferError, Resource},
@@ -20,7 +21,6 @@ use crate::{
 
 use arrayvec::ArrayVec;
 use hal::Device as _;
-use parking_lot::RwLock;
 
 use wgt::{BufferAddress, TextureFormat};
 
@@ -192,7 +192,15 @@ impl Global {
                 let ptr = if map_size == 0 {
                     std::ptr::NonNull::dangling()
                 } else {
-                    match map_buffer(device.raw(), &buffer, 0, map_size, HostMap::Write) {
+                    let snatch_guard = device.snatchable_lock.read();
+                    match map_buffer(
+                        device.raw(),
+                        &buffer,
+                        0,
+                        map_size,
+                        HostMap::Write,
+                        &snatch_guard,
+                    ) {
                         Ok(ptr) => ptr,
                         Err(e) => {
                             to_destroy.push(buffer);
@@ -249,7 +257,7 @@ impl Global {
                 hal::BufferUses::COPY_DST
             };
 
-            let (id, resource) = fid.assign(buffer);
+            let (id, resource) = fid.assign(Arc::new(buffer));
             api_log!("Device::create_buffer({desc:?}) -> {id:?}");
 
             device
@@ -564,7 +572,7 @@ impl Global {
                 Err(error) => break error,
             };
 
-            let (id, resource) = fid.assign(texture);
+            let (id, resource) = fid.assign(Arc::new(texture));
             api_log!("Device::create_texture({desc:?}) -> {id:?}");
 
             device
@@ -635,10 +643,12 @@ impl Global {
                 texture.hal_usage |= hal::TextureUses::COPY_DST;
             }
 
-            texture.initialization_status =
-                RwLock::new(TextureInitTracker::new(desc.mip_level_count, 0));
+            texture.initialization_status = RwLock::new(
+                rank::TEXTURE_INITIALIZATION_STATUS,
+                TextureInitTracker::new(desc.mip_level_count, 0),
+            );
 
-            let (id, resource) = fid.assign(texture);
+            let (id, resource) = fid.assign(Arc::new(texture));
             api_log!("Device::create_texture({desc:?}) -> {id:?}");
 
             device
@@ -691,7 +701,7 @@ impl Global {
 
             let buffer = device.create_buffer_from_hal(hal_buffer, desc);
 
-            let (id, buffer) = fid.assign(buffer);
+            let (id, buffer) = fid.assign(Arc::new(buffer));
             api_log!("Device::create_buffer -> {id:?}");
 
             device
@@ -810,7 +820,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, resource) = fid.assign(view);
+            let (id, resource) = fid.assign(Arc::new(view));
 
             {
                 let mut views = texture.views.lock();
@@ -892,7 +902,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, resource) = fid.assign(sampler);
+            let (id, resource) = fid.assign(Arc::new(sampler));
             api_log!("Device::create_sampler -> {id:?}");
             device.trackers.lock().samplers.insert_single(resource);
 
@@ -974,7 +984,7 @@ impl Global {
                 let bgl =
                     device.create_bind_group_layout(&desc.label, entry_map, bgl::Origin::Pool)?;
 
-                let (id_inner, arc) = fid.take().unwrap().assign(bgl);
+                let (id_inner, arc) = fid.take().unwrap().assign(Arc::new(bgl));
                 id = Some(id_inner);
 
                 Ok(arc)
@@ -1055,7 +1065,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, _) = fid.assign(layout);
+            let (id, _) = fid.assign(Arc::new(layout));
             api_log!("Device::create_pipeline_layout -> {id:?}");
             return (id, None);
         };
@@ -1122,7 +1132,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, resource) = fid.assign(bind_group);
+            let (id, resource) = fid.assign(Arc::new(bind_group));
 
             let weak_ref = Arc::downgrade(&resource);
             for range in &resource.used_texture_ranges {
@@ -1162,6 +1172,20 @@ impl Global {
         }
     }
 
+    /// Create a shader module with the given `source`.
+    ///
+    /// <div class="warning">
+    // NOTE: Keep this in sync with `naga::front::wgsl::parse_str`!
+    // NOTE: Keep this in sync with `wgpu::Device::create_shader_module`!
+    ///
+    /// This function may consume a lot of stack space. Compiler-enforced limits for parsing
+    /// recursion exist; if shader compilation runs into them, it will return an error gracefully.
+    /// However, on some build profiles and platforms, the default stack size for a thread may be
+    /// exceeded before this limit is reached during parsing. Callers should ensure that there is
+    /// enough stack space for this, particularly if calls to this method are exposed to user
+    /// input.
+    ///
+    /// </div>
     pub fn device_create_shader_module<A: HalApi>(
         &self,
         device_id: DeviceId,
@@ -1223,7 +1247,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, _) = fid.assign(shader);
+            let (id, _) = fid.assign(Arc::new(shader));
             api_log!("Device::create_shader_module -> {id:?}");
             return (id, None);
         };
@@ -1280,7 +1304,7 @@ impl Global {
                 Ok(shader) => shader,
                 Err(e) => break e,
             };
-            let (id, _) = fid.assign(shader);
+            let (id, _) = fid.assign(Arc::new(shader));
             api_log!("Device::create_shader_module_spirv -> {id:?}");
             return (id, None);
         };
@@ -1312,7 +1336,9 @@ impl Global {
         profiling::scope!("Device::create_command_encoder");
 
         let hub = A::hub(self);
-        let fid = hub.command_buffers.prepare(id_in.map(|id| id.transmute()));
+        let fid = hub
+            .command_buffers
+            .prepare(id_in.map(|id| id.into_command_buffer_id()));
 
         let error = loop {
             let device = match hub.devices.get(device_id) {
@@ -1327,9 +1353,6 @@ impl Global {
             };
             let encoder = match device
                 .command_allocator
-                .lock()
-                .as_mut()
-                .unwrap()
                 .acquire_encoder(device.raw(), queue.raw.as_ref().unwrap())
             {
                 Ok(raw) => raw,
@@ -1345,13 +1368,13 @@ impl Global {
                     .map(|s| s.to_string()),
             );
 
-            let (id, _) = fid.assign(command_buffer);
+            let (id, _) = fid.assign(Arc::new(command_buffer));
             api_log!("Device::create_command_encoder -> {id:?}");
-            return (id.transmute(), None);
+            return (id.into_command_encoder_id(), None);
         };
 
         let id = fid.assign_error(desc.label.borrow_or_default());
-        (id.transmute(), Some(error))
+        (id.into_command_encoder_id(), Some(error))
     }
 
     pub fn command_buffer_label<A: HalApi>(&self, id: id::CommandBufferId) -> String {
@@ -1366,7 +1389,7 @@ impl Global {
 
         if let Some(cmd_buf) = hub
             .command_buffers
-            .unregister(command_encoder_id.transmute())
+            .unregister(command_encoder_id.into_command_buffer_id())
         {
             cmd_buf.data.lock().as_mut().unwrap().encoder.discard();
             cmd_buf
@@ -1378,7 +1401,7 @@ impl Global {
     pub fn command_buffer_drop<A: HalApi>(&self, command_buffer_id: id::CommandBufferId) {
         profiling::scope!("CommandBuffer::drop");
         api_log!("CommandBuffer::drop {command_buffer_id:?}");
-        self.command_encoder_drop::<A>(command_buffer_id.transmute())
+        self.command_encoder_drop::<A>(command_buffer_id.into_command_encoder_id())
     }
 
     pub fn device_create_render_bundle_encoder(
@@ -1438,7 +1461,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, resource) = fid.assign(render_bundle);
+            let (id, resource) = fid.assign(Arc::new(render_bundle));
             api_log!("RenderBundleEncoder::finish -> {id:?}");
             device.trackers.lock().bundles.insert_single(resource);
             return (id, None);
@@ -1501,7 +1524,7 @@ impl Global {
                 Err(err) => break err,
             };
 
-            let (id, resource) = fid.assign(query_set);
+            let (id, resource) = fid.assign(Arc::new(query_set));
             api_log!("Device::create_query_set -> {id:?}");
             device.trackers.lock().query_sets.insert_single(resource);
 
@@ -1579,7 +1602,7 @@ impl Global {
                     Err(e) => break e,
                 };
 
-            let (id, resource) = fid.assign(pipeline);
+            let (id, resource) = fid.assign(Arc::new(pipeline));
             api_log!("Device::create_render_pipeline -> {id:?}");
 
             device
@@ -1712,7 +1735,7 @@ impl Global {
                 Err(e) => break e,
             };
 
-            let (id, resource) = fid.assign(pipeline);
+            let (id, resource) = fid.assign(Arc::new(pipeline));
             api_log!("Device::create_compute_pipeline -> {id:?}");
 
             device
@@ -1948,7 +1971,7 @@ impl Global {
                 };
 
                 let caps = unsafe {
-                    let suf = A::get_surface(surface);
+                    let suf = A::surface_as_hal(surface);
                     let adapter = &device.adapter;
                     match adapter.raw.adapter.surface_capabilities(suf.unwrap()) {
                         Some(caps) => caps,
@@ -2008,9 +2031,10 @@ impl Global {
                 }
 
                 // Wait for all work to finish before configuring the surface.
+                let snatch_guard = device.snatchable_lock.read();
                 let fence = device.fence.read();
                 let fence = fence.as_ref().unwrap();
-                match device.maintain(fence, wgt::Maintain::Wait) {
+                match device.maintain(fence, wgt::Maintain::Wait, snatch_guard) {
                     Ok((closures, _)) => {
                         user_callbacks = closures;
                     }
@@ -2033,7 +2057,7 @@ impl Global {
                 // https://github.com/gfx-rs/wgpu/issues/4105
 
                 match unsafe {
-                    A::get_surface(surface)
+                    A::surface_as_hal(surface)
                         .unwrap()
                         .configure(device.raw(), &hal_config)
                 } {
@@ -2097,28 +2121,42 @@ impl Global {
             .get(device_id)
             .map_err(|_| DeviceError::Invalid)?;
 
-        let (closures, queue_empty) = {
-            if let wgt::Maintain::WaitForSubmissionIndex(submission_index) = maintain {
-                if submission_index.queue_id != device_id.transmute() {
-                    return Err(WaitIdleError::WrongSubmissionIndex(
-                        submission_index.queue_id,
-                        device_id,
-                    ));
-                }
+        if let wgt::Maintain::WaitForSubmissionIndex(submission_index) = maintain {
+            if submission_index.queue_id != device_id.into_queue_id() {
+                return Err(WaitIdleError::WrongSubmissionIndex(
+                    submission_index.queue_id,
+                    device_id,
+                ));
             }
+        }
 
-            let fence = device.fence.read();
-            let fence = fence.as_ref().unwrap();
-            device.maintain(fence, maintain)?
-        };
+        let DevicePoll {
+            closures,
+            queue_empty,
+        } = Self::poll_single_device(&device, maintain)?;
+
+        closures.fire();
+
+        Ok(queue_empty)
+    }
+
+    fn poll_single_device<A: HalApi>(
+        device: &crate::device::Device<A>,
+        maintain: wgt::Maintain<queue::WrappedSubmissionIndex>,
+    ) -> Result<DevicePoll, WaitIdleError> {
+        let snatch_guard = device.snatchable_lock.read();
+        let fence = device.fence.read();
+        let fence = fence.as_ref().unwrap();
+        let (closures, queue_empty) = device.maintain(fence, maintain, snatch_guard)?;
 
         // Some deferred destroys are scheduled in maintain so run this right after
         // to avoid holding on to them until the next device poll.
         device.deferred_resource_destruction();
 
-        closures.fire();
-
-        Ok(queue_empty)
+        Ok(DevicePoll {
+            closures,
+            queue_empty,
+        })
     }
 
     /// Poll all devices belonging to the backend `A`.
@@ -2127,7 +2165,7 @@ impl Global {
     ///
     /// Return `all_queue_empty` indicating whether there are more queue
     /// submissions still in flight.
-    fn poll_device<A: HalApi>(
+    fn poll_all_devices_of_api<A: HalApi>(
         &self,
         force_wait: bool,
         closures: &mut UserClosures,
@@ -2145,10 +2183,13 @@ impl Global {
                 } else {
                     wgt::Maintain::Poll
                 };
-                let fence = device.fence.read();
-                let fence = fence.as_ref().unwrap();
-                let (cbs, queue_empty) = device.maintain(fence, maintain)?;
-                all_queue_empty = all_queue_empty && queue_empty;
+
+                let DevicePoll {
+                    closures: cbs,
+                    queue_empty,
+                } = Self::poll_single_device(device, maintain)?;
+
+                all_queue_empty &= queue_empty;
 
                 closures.extend(cbs);
             }
@@ -2170,23 +2211,23 @@ impl Global {
 
         #[cfg(vulkan)]
         {
-            all_queue_empty =
-                self.poll_device::<hal::api::Vulkan>(force_wait, &mut closures)? && all_queue_empty;
+            all_queue_empty &=
+                self.poll_all_devices_of_api::<hal::api::Vulkan>(force_wait, &mut closures)?;
         }
         #[cfg(metal)]
         {
-            all_queue_empty =
-                self.poll_device::<hal::api::Metal>(force_wait, &mut closures)? && all_queue_empty;
+            all_queue_empty &=
+                self.poll_all_devices_of_api::<hal::api::Metal>(force_wait, &mut closures)?;
         }
         #[cfg(dx12)]
         {
-            all_queue_empty =
-                self.poll_device::<hal::api::Dx12>(force_wait, &mut closures)? && all_queue_empty;
+            all_queue_empty &=
+                self.poll_all_devices_of_api::<hal::api::Dx12>(force_wait, &mut closures)?;
         }
         #[cfg(gles)]
         {
-            all_queue_empty =
-                self.poll_device::<hal::api::Gles>(force_wait, &mut closures)? && all_queue_empty;
+            all_queue_empty &=
+                self.poll_all_devices_of_api::<hal::api::Gles>(force_wait, &mut closures)?;
         }
 
         closures.fire();
@@ -2224,6 +2265,15 @@ impl Global {
         }
     }
 
+    // This is a test-only function to force the device into an
+    // invalid state by inserting an error value in its place in
+    // the registry.
+    pub fn device_make_invalid<A: HalApi>(&self, device_id: DeviceId) {
+        let hub = A::hub(self);
+        hub.devices
+            .force_replace_with_error(device_id, "Made invalid.");
+    }
+
     pub fn device_drop<A: HalApi>(&self, device_id: DeviceId) {
         profiling::scope!("Device::drop");
         api_log!("Device::drop {device_id:?}");
@@ -2259,7 +2309,7 @@ impl Global {
     ) {
         let hub = A::hub(self);
 
-        if let Ok(device) = hub.devices.get(device_id) {
+        if let Ok(Some(device)) = hub.devices.try_get(device_id) {
             let mut life_tracker = device.lock_life();
             if let Some(existing_closure) = life_tracker.device_lost_closure.take() {
                 // It's important to not hold the lock while calling the closure.
@@ -2268,6 +2318,12 @@ impl Global {
                 life_tracker = device.lock_life();
             }
             life_tracker.device_lost_closure = Some(device_lost_closure);
+        } else {
+            // No device? Okay. Just like we have to call any existing closure
+            // before we drop it, we need to call this closure before we exit
+            // this function, because there's no device that is ever going to
+            // call it.
+            device_lost_closure.call(DeviceLostReason::DeviceInvalid, "".to_string());
         }
     }
 
@@ -2562,4 +2618,9 @@ impl Global {
 
         buffer.unmap()
     }
+}
+
+struct DevicePoll {
+    closures: UserClosures,
+    queue_empty: bool,
 }

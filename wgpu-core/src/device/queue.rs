@@ -4,7 +4,7 @@ use crate::{
     api_log,
     command::{
         extract_texture_selector, validate_linear_texture_data, validate_texture_copy_range,
-        ClearError, CommandBuffer, CopySide, ImageCopyTexture, TransferError,
+        ClearError, CommandAllocator, CommandBuffer, CopySide, ImageCopyTexture, TransferError,
     },
     conv,
     device::{life::ResourceMaps, DeviceError, WaitIdleError},
@@ -12,8 +12,9 @@ use crate::{
     global::Global,
     hal_api::HalApi,
     hal_label,
-    id::{self, QueueId},
+    id::{self, DeviceId, QueueId},
     init_tracker::{has_copy_partial_init_tracker_coverage, TextureInitRange},
+    lock::{rank, Mutex},
     resource::{
         Buffer, BufferAccessError, BufferMapState, DestroyedBuffer, DestroyedTexture, Resource,
         ResourceInfo, ResourceType, StagingBuffer, Texture, TextureInner,
@@ -22,7 +23,6 @@ use crate::{
 };
 
 use hal::{CommandEncoder as _, Device as _, Queue as _};
-use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 use std::{
@@ -34,9 +34,9 @@ use thiserror::Error;
 use super::Device;
 
 pub struct Queue<A: HalApi> {
-    pub device: Option<Arc<Device<A>>>,
-    pub raw: Option<A::Queue>,
-    pub info: ResourceInfo<Queue<A>>,
+    pub(crate) device: Option<Arc<Device<A>>>,
+    pub(crate) raw: Option<A::Queue>,
+    pub(crate) info: ResourceInfo<Queue<A>>,
 }
 
 impl<A: HalApi> Resource for Queue<A> {
@@ -152,13 +152,21 @@ pub enum TempResource<A: HalApi> {
     Texture(Arc<Texture<A>>),
 }
 
-/// A queue execution for a particular command encoder.
+/// A series of raw [`CommandBuffer`]s that have been submitted to a
+/// queue, and the [`wgpu_hal::CommandEncoder`] that built them.
+///
+/// [`CommandBuffer`]: hal::Api::CommandBuffer
+/// [`wgpu_hal::CommandEncoder`]: hal::CommandEncoder
 pub(crate) struct EncoderInFlight<A: HalApi> {
     raw: A::CommandEncoder,
     cmd_buffers: Vec<A::CommandBuffer>,
 }
 
 impl<A: HalApi> EncoderInFlight<A> {
+    /// Free all of our command buffers.
+    ///
+    /// Return the command encoder, fully reset and ready to be
+    /// reused.
     pub(crate) unsafe fn land(mut self) -> A::CommandEncoder {
         unsafe { self.raw.reset_all(self.cmd_buffers.into_iter()) };
         self.raw
@@ -192,6 +200,8 @@ pub(crate) struct PendingWrites<A: HalApi> {
     /// True if `command_encoder` is in the "recording" state, as
     /// described in the docs for the [`wgpu_hal::CommandEncoder`]
     /// trait.
+    ///
+    /// [`wgpu_hal::CommandEncoder`]: hal::CommandEncoder
     pub is_recording: bool,
 
     pub temp_resources: Vec<TempResource<A>>,
@@ -253,7 +263,7 @@ impl<A: HalApi> PendingWrites<A> {
     #[must_use]
     fn post_submit(
         &mut self,
-        command_allocator: &mut super::CommandAllocator<A>,
+        command_allocator: &CommandAllocator<A>,
         device: &A::Device,
         queue: &A::Queue,
     ) -> Option<EncoderInFlight<A>> {
@@ -307,7 +317,7 @@ fn prepare_staging_buffer<A: HalApi>(
     let mapping = unsafe { device.raw().map_buffer(&buffer, 0..size) }?;
 
     let staging_buffer = StagingBuffer {
-        raw: Mutex::new(Some(buffer)),
+        raw: Mutex::new(rank::STAGING_BUFFER_RAW, Some(buffer)),
         device: device.clone(),
         size,
         info: ResourceInfo::new(
@@ -342,6 +352,15 @@ pub struct InvalidQueue;
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum QueueWriteError {
+    #[error(
+        "Device of queue ({:?}) does not match device of write recipient ({:?})",
+        queue_device_id,
+        target_device_id
+    )]
+    DeviceMismatch {
+        queue_device_id: DeviceId,
+        target_device_id: DeviceId,
+    },
     #[error(transparent)]
     Queue(#[from] DeviceError),
     #[error(transparent)]
@@ -386,12 +405,30 @@ impl Global {
 
         let hub = A::hub(self);
 
+        let buffer_device_id = hub
+            .buffers
+            .get(buffer_id)
+            .map_err(|_| TransferError::InvalidBuffer(buffer_id))?
+            .device
+            .as_info()
+            .id();
+
         let queue = hub
             .queues
             .get(queue_id)
             .map_err(|_| DeviceError::InvalidQueueId)?;
 
         let device = queue.device.as_ref().unwrap();
+
+        {
+            let queue_device_id = device.as_info().id();
+            if buffer_device_id != queue_device_id {
+                return Err(QueueWriteError::DeviceMismatch {
+                    queue_device_id,
+                    target_device_id: buffer_device_id,
+                });
+            }
+        }
 
         let data_size = data.len() as wgt::BufferAddress;
 
@@ -463,7 +500,7 @@ impl Global {
             prepare_staging_buffer(device, buffer_size.get(), device.instance_flags)?;
 
         let fid = hub.staging_buffers.prepare(id_in);
-        let (id, _) = fid.assign(staging_buffer);
+        let (id, _) = fid.assign(Arc::new(staging_buffer));
         resource_log!("Queue::create_staging_buffer {id:?}");
 
         Ok((id, staging_buffer_ptr))
@@ -680,7 +717,7 @@ impl Global {
             .get(destination.texture)
             .map_err(|_| TransferError::InvalidTexture(destination.texture))?;
 
-        if dst.device.as_info().id() != queue_id.transmute() {
+        if dst.device.as_info().id().into_queue_id() != queue_id {
             return Err(DeviceError::WrongDevice.into());
         }
 
@@ -788,6 +825,7 @@ impl Global {
                         &mut trackers.textures,
                         &device.alignments,
                         device.zero_buffer.as_ref().unwrap(),
+                        &device.snatchable_lock.read(),
                     )
                     .map_err(QueueWriteError::from)?;
                 }
@@ -1057,6 +1095,7 @@ impl Global {
                         &mut trackers.textures,
                         &device.alignments,
                         device.zero_buffer.as_ref().unwrap(),
+                        &device.snatchable_lock.read(),
                     )
                     .map_err(QueueWriteError::from)?;
                 }
@@ -1120,6 +1159,9 @@ impl Global {
 
             let device = queue.device.as_ref().unwrap();
 
+            let snatch_guard = device.snatchable_lock.read();
+
+            // Fence lock must be acquired after the snatch lock everywhere to avoid deadlocks.
             let mut fence = device.fence.write();
             let fence = fence.as_mut().unwrap();
             let submit_index = device
@@ -1128,9 +1170,7 @@ impl Global {
                 + 1;
             let mut active_executions = Vec::new();
 
-            let mut used_surface_textures = track::TextureUsageScope::new();
-
-            let snatch_guard = device.snatchable_lock.read();
+            let mut used_surface_textures = track::TextureUsageScope::default();
 
             let mut submit_surface_textures_owned = SmallVec::<[_; 2]>::new();
 
@@ -1161,7 +1201,7 @@ impl Global {
                             Err(_) => continue,
                         };
 
-                        if cmdbuf.device.as_info().id() != queue_id.transmute() {
+                        if cmdbuf.device.as_info().id().into_queue_id() != queue_id {
                             return Err(DeviceError::WrongDevice.into());
                         }
 
@@ -1180,13 +1220,10 @@ impl Global {
                             ));
                         }
                         if !cmdbuf.is_finished() {
-                            if let Some(cmdbuf) = Arc::into_inner(cmdbuf) {
-                                device.destroy_command_buffer(cmdbuf);
-                            } else {
-                                panic!(
-                                    "Command buffer cannot be destroyed because is still in use"
-                                );
-                            }
+                            let cmdbuf = Arc::into_inner(cmdbuf).expect(
+                                "Command buffer cannot be destroyed because is still in use",
+                            );
+                            device.destroy_command_buffer(cmdbuf);
                             continue;
                         }
 
@@ -1364,10 +1401,10 @@ impl Global {
                         //Note: locking the trackers has to be done after the storages
                         let mut trackers = device.trackers.lock();
                         baked
-                            .initialize_buffer_memory(&mut *trackers)
+                            .initialize_buffer_memory(&mut *trackers, &snatch_guard)
                             .map_err(|err| QueueSubmitError::DestroyedBuffer(err.0))?;
                         baked
-                            .initialize_texture_memory(&mut *trackers, device)
+                            .initialize_texture_memory(&mut *trackers, device, &snatch_guard)
                             .map_err(|err| QueueSubmitError::DestroyedTexture(err.0))?;
                         //Note: stateless trackers are not merged:
                         // device already knows these resources exist.
@@ -1408,7 +1445,7 @@ impl Global {
                                 baked.encoder.end_encoding().unwrap()
                             };
                             baked.list.push(present);
-                            used_surface_textures = track::TextureUsageScope::new();
+                            used_surface_textures = track::TextureUsageScope::default();
                         }
 
                         // done
@@ -1498,7 +1535,7 @@ impl Global {
 
             profiling::scope!("cleanup");
             if let Some(pending_execution) = pending_writes.post_submit(
-                device.command_allocator.lock().as_mut().unwrap(),
+                &device.command_allocator,
                 device.raw(),
                 queue.raw.as_ref().unwrap(),
             ) {
@@ -1515,7 +1552,7 @@ impl Global {
 
             // This will schedule destruction of all resources that are no longer needed
             // by the user but used in the command stream, among other things.
-            let (closures, _) = match device.maintain(fence, wgt::Maintain::Poll) {
+            let (closures, _) = match device.maintain(fence, wgt::Maintain::Poll, snatch_guard) {
                 Ok(closures) => closures,
                 Err(WaitIdleError::Device(err)) => return Err(QueueSubmitError::Queue(err)),
                 Err(WaitIdleError::StuckGpu) => return Err(QueueSubmitError::StuckGpu),

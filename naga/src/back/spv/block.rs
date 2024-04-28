@@ -239,6 +239,7 @@ impl<'w> BlockContext<'w> {
                 let init = self.ir_module.constants[handle].init;
                 self.writer.constant_ids[init.index()]
             }
+            crate::Expression::Override(_) => return Err(Error::Override),
             crate::Expression::ZeroValue(_) => self.writer.get_constant_null(result_type_id),
             crate::Expression::Compose { ty, ref components } => {
                 self.temp_list.clear();
@@ -944,8 +945,7 @@ impl<'w> BlockContext<'w> {
                     )),
                     Mf::CountTrailingZeros => {
                         let uint_id = match *arg_ty {
-                            crate::TypeInner::Vector { size, mut scalar } => {
-                                scalar.kind = crate::ScalarKind::Uint;
+                            crate::TypeInner::Vector { size, scalar } => {
                                 let ty = LocalType::Value {
                                     vector_size: Some(size),
                                     scalar,
@@ -956,15 +956,15 @@ impl<'w> BlockContext<'w> {
                                 self.temp_list.clear();
                                 self.temp_list.resize(
                                     size as _,
-                                    self.writer.get_constant_scalar_with(32, scalar)?,
+                                    self.writer
+                                        .get_constant_scalar_with(scalar.width * 8, scalar)?,
                                 );
 
                                 self.writer.get_constant_composite(ty, &self.temp_list)
                             }
-                            crate::TypeInner::Scalar(mut scalar) => {
-                                scalar.kind = crate::ScalarKind::Uint;
-                                self.writer.get_constant_scalar_with(32, scalar)?
-                            }
+                            crate::TypeInner::Scalar(scalar) => self
+                                .writer
+                                .get_constant_scalar_with(scalar.width * 8, scalar)?,
                             _ => unreachable!(),
                         };
 
@@ -986,9 +986,8 @@ impl<'w> BlockContext<'w> {
                         ))
                     }
                     Mf::CountLeadingZeros => {
-                        let (int_type_id, int_id) = match *arg_ty {
-                            crate::TypeInner::Vector { size, mut scalar } => {
-                                scalar.kind = crate::ScalarKind::Sint;
+                        let (int_type_id, int_id, width) = match *arg_ty {
+                            crate::TypeInner::Vector { size, scalar } => {
                                 let ty = LocalType::Value {
                                     vector_size: Some(size),
                                     scalar,
@@ -999,32 +998,41 @@ impl<'w> BlockContext<'w> {
                                 self.temp_list.clear();
                                 self.temp_list.resize(
                                     size as _,
-                                    self.writer.get_constant_scalar_with(31, scalar)?,
+                                    self.writer
+                                        .get_constant_scalar_with(scalar.width * 8 - 1, scalar)?,
                                 );
 
                                 (
                                     self.get_type_id(ty),
                                     self.writer.get_constant_composite(ty, &self.temp_list),
+                                    scalar.width,
                                 )
                             }
-                            crate::TypeInner::Scalar(mut scalar) => {
-                                scalar.kind = crate::ScalarKind::Sint;
-                                (
-                                    self.get_type_id(LookupType::Local(LocalType::Value {
-                                        vector_size: None,
-                                        scalar,
-                                        pointer_space: None,
-                                    })),
-                                    self.writer.get_constant_scalar_with(31, scalar)?,
-                                )
-                            }
+                            crate::TypeInner::Scalar(scalar) => (
+                                self.get_type_id(LookupType::Local(LocalType::Value {
+                                    vector_size: None,
+                                    scalar,
+                                    pointer_space: None,
+                                })),
+                                self.writer
+                                    .get_constant_scalar_with(scalar.width * 8 - 1, scalar)?,
+                                scalar.width,
+                            ),
                             _ => unreachable!(),
+                        };
+
+                        if width != 4 {
+                            unreachable!("This is validated out until a polyfill is implemented. https://github.com/gfx-rs/wgpu/issues/5276");
                         };
 
                         let msb_id = self.gen_id();
                         block.body.push(Instruction::ext_inst(
                             self.writer.gl450_ext_inst_id,
-                            spirv::GLOp::FindUMsb,
+                            if width != 4 {
+                                spirv::GLOp::FindILsb
+                            } else {
+                                spirv::GLOp::FindUMsb
+                            },
                             int_type_id,
                             msb_id,
                             &[arg0_id],
@@ -1065,7 +1073,7 @@ impl<'w> BlockContext<'w> {
                         //
                         // bitfieldExtract(x, o, c)
 
-                        let bit_width = arg_ty.scalar_width().unwrap();
+                        let bit_width = arg_ty.scalar_width().unwrap() * 8;
                         let width_constant = self
                             .writer
                             .get_constant_scalar(crate::Literal::U32(bit_width as u32));
@@ -1121,7 +1129,7 @@ impl<'w> BlockContext<'w> {
                     Mf::InsertBits => {
                         // The behavior of InsertBits has the same undefined behavior as ExtractBits.
 
-                        let bit_width = arg_ty.scalar_width().unwrap();
+                        let bit_width = arg_ty.scalar_width().unwrap() * 8;
                         let width_constant = self
                             .writer
                             .get_constant_scalar(crate::Literal::U32(bit_width as u32));
@@ -1176,11 +1184,18 @@ impl<'w> BlockContext<'w> {
                         ))
                     }
                     Mf::FindLsb => MathOp::Ext(spirv::GLOp::FindILsb),
-                    Mf::FindMsb => MathOp::Ext(match arg_scalar_kind {
-                        Some(crate::ScalarKind::Uint) => spirv::GLOp::FindUMsb,
-                        Some(crate::ScalarKind::Sint) => spirv::GLOp::FindSMsb,
-                        other => unimplemented!("Unexpected findMSB({:?})", other),
-                    }),
+                    Mf::FindMsb => {
+                        if arg_ty.scalar_width() == Some(4) {
+                            let thing = match arg_scalar_kind {
+                                Some(crate::ScalarKind::Uint) => spirv::GLOp::FindUMsb,
+                                Some(crate::ScalarKind::Sint) => spirv::GLOp::FindSMsb,
+                                other => unimplemented!("Unexpected findMSB({:?})", other),
+                            };
+                            MathOp::Ext(thing)
+                        } else {
+                            unreachable!("This is validated out until a polyfill is implemented. https://github.com/gfx-rs/wgpu/issues/5276");
+                        }
+                    }
                     Mf::Pack4x8unorm => MathOp::Ext(spirv::GLOp::PackUnorm4x8),
                     Mf::Pack4x8snorm => MathOp::Ext(spirv::GLOp::PackSnorm4x8),
                     Mf::Pack2x16float => MathOp::Ext(spirv::GLOp::PackHalf2x16),
@@ -1264,7 +1279,9 @@ impl<'w> BlockContext<'w> {
             crate::Expression::CallResult(_)
             | crate::Expression::AtomicResult { .. }
             | crate::Expression::WorkGroupUniformLoadResult { .. }
-            | crate::Expression::RayQueryProceedResult => self.cached[expr_handle],
+            | crate::Expression::RayQueryProceedResult
+            | crate::Expression::SubgroupBallotResult
+            | crate::Expression::SubgroupOperationResult { .. } => self.cached[expr_handle],
             crate::Expression::As {
                 expr,
                 kind,
@@ -1384,6 +1401,12 @@ impl<'w> BlockContext<'w> {
                         }
                         (Sk::Uint, Sk::Float, Some(_)) => Cast::Unary(spirv::Op::ConvertUToF),
                         (Sk::Uint, Sk::Uint, Some(dst_width)) if src_scalar.width != dst_width => {
+                            Cast::Unary(spirv::Op::UConvert)
+                        }
+                        (Sk::Uint, Sk::Sint, Some(dst_width)) if src_scalar.width != dst_width => {
+                            Cast::Unary(spirv::Op::SConvert)
+                        }
+                        (Sk::Sint, Sk::Uint, Some(dst_width)) if src_scalar.width != dst_width => {
                             Cast::Unary(spirv::Op::UConvert)
                         }
                         // We assume it's either an identity cast, or int-uint.
@@ -2468,6 +2491,27 @@ impl<'w> BlockContext<'w> {
                 }
                 crate::Statement::RayQuery { query, ref fun } => {
                     self.write_ray_query_function(query, fun, &mut block);
+                }
+                crate::Statement::SubgroupBallot {
+                    result,
+                    ref predicate,
+                } => {
+                    self.write_subgroup_ballot(predicate, result, &mut block)?;
+                }
+                crate::Statement::SubgroupCollectiveOperation {
+                    ref op,
+                    ref collective_op,
+                    argument,
+                    result,
+                } => {
+                    self.write_subgroup_operation(op, collective_op, argument, result, &mut block)?;
+                }
+                crate::Statement::SubgroupGather {
+                    ref mode,
+                    argument,
+                    result,
+                } => {
+                    self.write_subgroup_gather(mode, argument, result, &mut block)?;
                 }
             }
         }
