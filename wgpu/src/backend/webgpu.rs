@@ -1690,10 +1690,10 @@ impl crate::context::Context for ContextWebGpu {
         desc: ShaderModuleDescriptor<'_>,
         _shader_bound_checks: wgt::ShaderBoundChecks,
     ) -> Result<(Self::ShaderModuleId, Self::ShaderModuleData), String> {
-        let mut descriptor: webgpu_sys::GpuShaderModuleDescriptor = match desc.source {
+        let shader_module_result = match desc.source {
             #[cfg(feature = "spirv")]
             crate::ShaderSource::SpirV(ref spv) => {
-                use naga::{back, front, valid};
+                use naga::front;
 
                 let options = naga::front::spv::Options {
                     adjust_coordinate_space: false,
@@ -1701,18 +1701,25 @@ impl crate::context::Context for ContextWebGpu {
                     block_ctx_dump_prefix: None,
                 };
                 let spv_parser = front::spv::Frontend::new(spv.iter().cloned(), &options);
-                let spv_module = spv_parser.parse().unwrap();
-
-                let mut validator = valid::Validator::new(
-                    valid::ValidationFlags::all(),
-                    valid::Capabilities::all(),
-                );
-                let spv_module_info = validator.validate(&spv_module).unwrap();
-
-                let writer_flags = naga::back::wgsl::WriterFlags::empty();
-                let wgsl_text =
-                    back::wgsl::write_string(&spv_module, &spv_module_info, writer_flags).unwrap();
-                webgpu_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+                spv_parser
+                    .parse()
+                    .map_err(|inner| {
+                        CompilationInfo::from(naga::error::ShaderError {
+                            source: String::new(),
+                            label: desc.label.map(|s| s.to_string()),
+                            inner: Box::new(inner),
+                        })
+                    })
+                    .and_then(|spv_module| {
+                        validate_transformed_shader_module(&spv_module, "", &desc).map(|v| {
+                            (
+                                v,
+                                WebShaderCompilationInfo::Transformed {
+                                    compilation_info: CompilationInfo { messages: vec![] },
+                                },
+                            )
+                        })
+                    })
             }
             #[cfg(feature = "glsl")]
             crate::ShaderSource::Glsl {
@@ -1720,7 +1727,7 @@ impl crate::context::Context for ContextWebGpu {
                 stage,
                 ref defines,
             } => {
-                use naga::{back, front, valid};
+                use naga::front;
 
                 // Parse the given shader code and store its representation.
                 let options = front::glsl::Options {
@@ -1728,45 +1735,97 @@ impl crate::context::Context for ContextWebGpu {
                     defines: defines.clone(),
                 };
                 let mut parser = front::glsl::Frontend::default();
-                let glsl_module = parser.parse(&options, shader).unwrap();
-
-                let mut validator = valid::Validator::new(
-                    valid::ValidationFlags::all(),
-                    valid::Capabilities::all(),
-                );
-                let glsl_module_info = validator.validate(&glsl_module).unwrap();
-
-                let writer_flags = naga::back::wgsl::WriterFlags::empty();
-                let wgsl_text =
-                    back::wgsl::write_string(&glsl_module, &glsl_module_info, writer_flags)
-                        .unwrap();
-                webgpu_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+                parser
+                    .parse(&options, shader)
+                    .map_err(|inner| {
+                        CompilationInfo::from(naga::error::ShaderError {
+                            source: shader.to_string(),
+                            label: desc.label.map(|s| s.to_string()),
+                            inner: Box::new(inner),
+                        })
+                    })
+                    .and_then(|glsl_module| {
+                        validate_transformed_shader_module(&glsl_module, shader, &desc).map(|v| {
+                            (
+                                v,
+                                WebShaderCompilationInfo::Transformed {
+                                    compilation_info: CompilationInfo { messages: vec![] },
+                                },
+                            )
+                        })
+                    })
             }
             #[cfg(feature = "wgsl")]
-            crate::ShaderSource::Wgsl(ref code) => webgpu_sys::GpuShaderModuleDescriptor::new(code),
+            crate::ShaderSource::Wgsl(ref code) => {
+                let shader_module = webgpu_sys::GpuShaderModuleDescriptor::new(code);
+                Ok((
+                    shader_module,
+                    WebShaderCompilationInfo::Wgsl {
+                        source: code.to_string(),
+                    },
+                ))
+            }
             #[cfg(feature = "naga-ir")]
-            crate::ShaderSource::Naga(module) => {
-                use naga::{back, valid};
-
-                let mut validator = valid::Validator::new(
-                    valid::ValidationFlags::all(),
-                    valid::Capabilities::all(),
-                );
-                let module_info = validator.validate(&module).unwrap();
-
-                let writer_flags = naga::back::wgsl::WriterFlags::empty();
-                let wgsl_text =
-                    back::wgsl::write_string(&module, &module_info, writer_flags).unwrap();
-                webgpu_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+            crate::ShaderSource::Naga(ref module) => {
+                validate_transformed_shader_module(module, "", &desc).map(|v| {
+                    (
+                        v,
+                        WebShaderCompilationInfo::Transformed {
+                            compilation_info: CompilationInfo { messages: vec![] },
+                        },
+                    )
+                })
             }
             crate::ShaderSource::Dummy(_) => {
                 panic!("found `ShaderSource::Dummy`")
             }
         };
+
+        #[cfg(naga)]
+        fn validate_transformed_shader_module(
+            module: &naga::Module,
+            source: &str,
+            desc: &crate::ShaderModuleDescriptor<'_>,
+        ) -> Result<webgpu_sys::GpuShaderModuleDescriptor, crate::CompilationInfo> {
+            use naga::{back, valid};
+            let mut validator =
+                valid::Validator::new(valid::ValidationFlags::all(), valid::Capabilities::all());
+            let module_info = validator.validate(module).map_err(|err| {
+                CompilationInfo::from(naga::error::ShaderError {
+                    source: source.to_string(),
+                    label: desc.label.map(|s| s.to_string()),
+                    inner: Box::new(err),
+                })
+            })?;
+
+            let writer_flags = naga::back::wgsl::WriterFlags::empty();
+            let wgsl_text = back::wgsl::write_string(module, &module_info, writer_flags).unwrap();
+            Ok(webgpu_sys::GpuShaderModuleDescriptor::new(
+                wgsl_text.as_str(),
+            ))
+        }
+        let (mut descriptor, compilation_info) = match shader_module_result {
+            Ok(v) => v,
+            Err(compilation_info) => {
+                let mut message = String::new();
+                for m in &compilation_info.messages {
+                    if !message.is_empty() {
+                        message.push_str("\n\n");
+                    }
+                    message.push_str(&format!("{}", m));
+                }
+                return Err(message);
+            },
+        };
         if let Some(label) = desc.label {
             descriptor.label(label);
         }
-        Ok(create_identified(device_data.0.create_shader_module(&descriptor)))
+        let shader_module = WebShaderModule {
+            module: device_data.0.create_shader_module(&descriptor),
+            compilation_info,
+        };
+        let (id, data) = create_identified(shader_module);
+        Ok((id, data))
     }
 
     unsafe fn device_create_shader_module_spirv(
