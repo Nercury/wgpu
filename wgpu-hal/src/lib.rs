@@ -333,6 +333,12 @@ pub enum PipelineError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum PipelineCacheError {
+    #[error(transparent)]
+    Device(#[from] DeviceError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum SurfaceError {
     #[error("Surface is lost")]
     Lost,
@@ -432,6 +438,7 @@ pub trait Api: Clone + fmt::Debug + Sized {
     type ShaderModule: fmt::Debug + WasmNotSendSync;
     type RenderPipeline: fmt::Debug + WasmNotSendSync;
     type ComputePipeline: fmt::Debug + WasmNotSendSync;
+    type PipelineCache: fmt::Debug + WasmNotSendSync;
 
     type AccelerationStructure: fmt::Debug + WasmNotSendSync + 'static;
 }
@@ -522,6 +529,70 @@ pub trait Adapter: WasmNotSendSync {
     unsafe fn get_presentation_timestamp(&self) -> wgt::PresentationTimestamp;
 }
 
+/// A connection to a GPU and a pool of resources to use with it.
+///
+/// A `wgpu-hal` `Device` represents an open connection to a specific graphics
+/// processor, controlled via the backend [`Device::A`]. A `Device` is mostly
+/// used for creating resources. Each `Device` has an associated [`Queue`] used
+/// for command submission.
+///
+/// On Vulkan a `Device` corresponds to a logical device ([`VkDevice`]). Other
+/// backends don't have an exact analog: for example, [`ID3D12Device`]s and
+/// [`MTLDevice`]s are owned by the backends' [`wgpu_hal::Adapter`]
+/// implementations, and shared by all [`wgpu_hal::Device`]s created from that
+/// `Adapter`.
+///
+/// A `Device`'s life cycle is generally:
+///
+/// 1)  Obtain a `Device` and its associated [`Queue`] by calling
+///     [`Adapter::open`].
+///
+///     Alternatively, the backend-specific types that implement [`Adapter`] often
+///     have methods for creating a `wgpu-hal` `Device` from a platform-specific
+///     handle. For example, [`vulkan::Adapter::device_from_raw`] can create a
+///     [`vulkan::Device`] from an [`ash::Device`].
+///
+/// 1)  Create resources to use on the device by calling methods like
+///     [`Device::create_texture`] or [`Device::create_shader_module`].
+///
+/// 1)  Call [`Device::create_command_encoder`] to obtain a [`CommandEncoder`],
+///     which you can use to build [`CommandBuffer`]s holding commands to be
+///     executed on the GPU.
+///
+/// 1)  Call [`Queue::submit`] on the `Device`'s associated [`Queue`] to submit
+///     [`CommandBuffer`]s for execution on the GPU. If needed, call
+///     [`Device::wait`] to wait for them to finish execution.
+///
+/// 1)  Free resources with methods like [`Device::destroy_texture`] or
+///     [`Device::destroy_shader_module`].
+///
+/// 1)  Shut down the device by calling [`Device::exit`].
+///
+/// [`vkDevice`]: https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#VkDevice
+/// [`ID3D12Device`]: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12device
+/// [`MTLDevice`]: https://developer.apple.com/documentation/metal/mtldevice
+/// [`wgpu_hal::Adapter`]: Adapter
+/// [`wgpu_hal::Device`]: Device
+/// [`vulkan::Adapter::device_from_raw`]: vulkan/struct.Adapter.html#method.device_from_raw
+/// [`vulkan::Device`]: vulkan/struct.Device.html
+/// [`ash::Device`]: https://docs.rs/ash/latest/ash/struct.Device.html
+/// [`CommandBuffer`]: Api::CommandBuffer
+///
+/// # Safety
+///
+/// As with other `wgpu-hal` APIs, [validation] is the caller's
+/// responsibility. Here are the general requirements for all `Device`
+/// methods:
+///
+/// - Any resource passed to a `Device` method must have been created by that
+///   `Device`. For example, a [`Texture`] passed to [`Device::destroy_texture`] must
+///   have been created with the `Device` passed as `self`.
+///
+/// - Resources may not be destroyed if they are used by any submitted command
+///   buffers that have not yet finished execution.
+///
+/// [validation]: index.html#validation-is-the-calling-codes-responsibility-not-wgpu-hals
+/// [`Texture`]: Api::Texture
 pub trait Device: WasmNotSendSync {
     type A: Api;
 
@@ -611,6 +682,14 @@ pub trait Device: WasmNotSendSync {
         desc: &ComputePipelineDescriptor<Self::A>,
     ) -> Result<<Self::A as Api>::ComputePipeline, PipelineError>;
     unsafe fn destroy_compute_pipeline(&self, pipeline: <Self::A as Api>::ComputePipeline);
+    unsafe fn create_pipeline_cache(
+        &self,
+        desc: &PipelineCacheDescriptor<'_>,
+    ) -> Result<<Self::A as Api>::PipelineCache, PipelineCacheError>;
+    fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
+        None
+    }
+    unsafe fn destroy_pipeline_cache(&self, cache: <Self::A as Api>::PipelineCache);
 
     unsafe fn create_query_set(
         &self,
@@ -651,6 +730,14 @@ pub trait Device: WasmNotSendSync {
 
     unsafe fn start_capture(&self) -> bool;
     unsafe fn stop_capture(&self);
+
+    #[allow(unused_variables)]
+    unsafe fn pipeline_cache_get_data(
+        &self,
+        cache: &<Self::A as Api>::PipelineCache,
+    ) -> Option<Vec<u8>> {
+        None
+    }
 
     unsafe fn create_acceleration_structure(
         &self,
@@ -698,22 +785,35 @@ pub trait Queue: WasmNotSendSync {
     /// themselves are unordered. If each thread uses a separate [`Fence`], this
     /// problem does not arise.
     ///
-    /// Valid usage:
+    /// # Safety
     ///
-    /// - All of the [`CommandBuffer`][cb]s were created from
-    ///   [`CommandEncoder`][ce]s that are associated with this queue.
+    /// - Each [`CommandBuffer`][cb] in `command_buffers` must have been created
+    ///   from a [`CommandEncoder`][ce] that was constructed from the
+    ///   [`Device`][d] associated with this [`Queue`].
     ///
-    /// - All of those [`CommandBuffer`][cb]s must remain alive until
-    ///   the submitted commands have finished execution. (Since
-    ///   command buffers must not outlive their encoders, this
-    ///   implies that the encoders must remain alive as well.)
+    /// - Each [`CommandBuffer`][cb] must remain alive until the submitted
+    ///   commands have finished execution. Since command buffers must not
+    ///   outlive their encoders, this implies that the encoders must remain
+    ///   alive as well.
     ///
-    /// - All of the [`SurfaceTexture`][st]s that the command buffers
-    ///   write to appear in the `surface_textures` argument.
+    /// - All resources used by a submitted [`CommandBuffer`][cb]
+    ///   ([`Texture`][t]s, [`BindGroup`][bg]s, [`RenderPipeline`][rp]s, and so
+    ///   on) must remain alive until the command buffer finishes execution.
+    ///
+    /// - Every [`SurfaceTexture`][st] that any command in `command_buffers`
+    ///   writes to must appear in the `surface_textures` argument.
+    ///
+    /// - Each [`SurfaceTexture`][st] in `surface_textures` must be configured
+    ///   for use with the [`Device`][d] associated with this [`Queue`],
+    ///   typically by calling [`Surface::configure`].
     ///
     /// [`Fence`]: Api::Fence
     /// [cb]: Api::CommandBuffer
     /// [ce]: Api::CommandEncoder
+    /// [d]: Api::Device
+    /// [t]: Api::Texture
+    /// [bg]: Api::BindGroup
+    /// [rp]: Api::RenderPipeline
     /// [st]: Api::SurfaceTexture
     unsafe fn submit(
         &self,
@@ -1636,6 +1736,13 @@ pub struct ComputePipelineDescriptor<'a, A: Api> {
     pub layout: &'a A::PipelineLayout,
     /// The compiled compute stage and its entry point.
     pub stage: ProgrammableStage<'a, A>,
+    /// The cache which will be used and filled when compiling this pipeline
+    pub cache: Option<&'a A::PipelineCache>,
+}
+
+pub struct PipelineCacheDescriptor<'a> {
+    pub label: Label<'a>,
+    pub data: Option<&'a [u8]>,
 }
 
 /// Describes how the vertex buffer is interpreted.
@@ -1672,6 +1779,8 @@ pub struct RenderPipelineDescriptor<'a, A: Api> {
     /// If the pipeline will be used with a multiview render pass, this indicates how many array
     /// layers the attachments will have.
     pub multiview: Option<NonZeroU32>,
+    /// The cache which will be used and filled when compiling this pipeline
+    pub cache: Option<&'a A::PipelineCache>,
 }
 
 #[derive(Debug, Clone)]
