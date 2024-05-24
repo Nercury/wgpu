@@ -19,8 +19,9 @@ use std::{
 };
 use wasm_bindgen::{prelude::*, JsCast};
 
-use crate::{context::{downcast_ref, ObjectId, QueueWriteBuffer, Unused}, ShaderModuleDescriptor, SurfaceTargetUnsafe, UncapturedErrorHandler};
+use crate::{CompilationMessageType, context::{downcast_ref, ObjectId, QueueWriteBuffer, Unused}, ShaderModuleDescriptor, SurfaceTargetUnsafe, UncapturedErrorHandler};
 use crate::{CompilationInfo};
+use crate::backend::webgpu::webgpu_sys::GpuShaderModuleDescriptor;
 
 fn create_identified<T>(value: T) -> (Identified<T>, Sendable<T>) {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1804,19 +1805,37 @@ impl crate::context::Context for ContextWebGpu {
                 wgsl_text.as_str(),
             ))
         }
-        let (mut descriptor, compilation_info) = match shader_module_result {
+        let (mut descriptor, compilation_info): (GpuShaderModuleDescriptor, WebShaderCompilationInfo) = match shader_module_result {
             Ok(v) => v,
-            Err(compilation_info) => {
+            Err(ci) => {
+                let compilation_info: CompilationInfo = ci;
                 let mut message = String::new();
                 for m in &compilation_info.messages {
                     if !message.is_empty() {
                         message.push_str("\n\n");
                     }
-                    message.push_str(&format!("{}", m));
+                    let typ = match m.message_type {
+                        CompilationMessageType::Error => "ERROR",
+                        CompilationMessageType::Warning => "WARNING",
+                        CompilationMessageType::Info => "INFO",
+                    };
+                    let loc = match m.location.as_ref() {
+                        None => String::new(),
+                        Some(l) => format!(", line {}, col: {}", l.line_number, l.line_position),
+                    };
+                    message.push_str(&format!("[{}{}] {}", typ, loc, m.message));
                 }
                 return Err(message);
             },
         };
+        // let (mut descriptor, compilation_info) = match shader_module_result {
+        //     Ok(v) => v,
+        //     Err(compilation_info) => (
+        //         webgpu_sys::GpuShaderModuleDescriptor::new(""),
+        //         WebShaderCompilationInfo::Transformed { compilation_info },
+        //     ),
+        // };
+
         if let Some(label) = desc.label {
             descriptor.label(label);
         }
