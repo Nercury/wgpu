@@ -78,7 +78,6 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
     type SurfaceData: ContextData;
 
     type SurfaceOutputDetail: WasmNotSendSync + 'static;
-    type SubmissionIndex: ContextId + Clone + Copy + WasmNotSendSync;
     type SubmissionIndexData: ContextData + Copy;
 
     type RequestAdapterFuture: Future<Output = Option<(Self::AdapterId, Self::AdapterData)>>
@@ -474,26 +473,12 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
         encoder_data: &Self::CommandEncoderData,
         desc: &ComputePassDescriptor<'_>,
     ) -> (Self::ComputePassId, Self::ComputePassData);
-    fn command_encoder_end_compute_pass(
-        &self,
-        encoder: &Self::CommandEncoderId,
-        encoder_data: &Self::CommandEncoderData,
-        pass: &mut Self::ComputePassId,
-        pass_data: &mut Self::ComputePassData,
-    );
     fn command_encoder_begin_render_pass(
         &self,
         encoder: &Self::CommandEncoderId,
         encoder_data: &Self::CommandEncoderData,
-        desc: &RenderPassDescriptor<'_, '_>,
+        desc: &RenderPassDescriptor<'_>,
     ) -> (Self::RenderPassId, Self::RenderPassData);
-    fn command_encoder_end_render_pass(
-        &self,
-        encoder: &Self::CommandEncoderId,
-        encoder_data: &Self::CommandEncoderData,
-        pass: &mut Self::RenderPassId,
-        pass_data: &mut Self::RenderPassData,
-    );
     fn command_encoder_finish(
         &self,
         encoder: Self::CommandEncoderId,
@@ -618,7 +603,7 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
         queue: &Self::QueueId,
         queue_data: &Self::QueueData,
         command_buffers: I,
-    ) -> (Self::SubmissionIndex, Self::SubmissionIndexData);
+    ) -> Self::SubmissionIndexData;
     fn queue_get_timestamp_period(
         &self,
         queue: &Self::QueueId,
@@ -633,6 +618,18 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
 
     fn device_start_capture(&self, device: &Self::DeviceId, device_data: &Self::DeviceData);
     fn device_stop_capture(&self, device: &Self::DeviceId, device_data: &Self::DeviceData);
+
+    fn device_get_internal_counters(
+        &self,
+        device: &Self::DeviceId,
+        _device_data: &Self::DeviceData,
+    ) -> wgt::InternalCounters;
+
+    fn device_generate_allocator_report(
+        &self,
+        device: &Self::DeviceId,
+        _device_data: &Self::DeviceData,
+    ) -> Option<wgt::AllocatorReport>;
 
     fn pipeline_cache_get_data(
         &self,
@@ -716,6 +713,11 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
         indirect_buffer: &Self::BufferId,
         indirect_buffer_data: &Self::BufferData,
         indirect_offset: BufferAddress,
+    );
+    fn compute_pass_end(
+        &self,
+        pass: &mut Self::ComputePassId,
+        pass_data: &mut Self::ComputePassData,
     );
 
     fn render_bundle_encoder_set_pipeline(
@@ -1049,6 +1051,7 @@ pub trait Context: Debug + WasmNotSendSync + Sized {
         pass_data: &mut Self::RenderPassData,
         render_bundles: &mut dyn Iterator<Item = (Self::RenderBundleId, &Self::RenderBundleData)>,
     );
+    fn render_pass_end(&self, pass: &mut Self::RenderPassId, pass_data: &mut Self::RenderPassData);
 }
 
 /// Object id.
@@ -1490,26 +1493,12 @@ pub(crate) trait DynContext: Debug + WasmNotSendSync {
         encoder_data: &crate::Data,
         desc: &ComputePassDescriptor<'_>,
     ) -> (ObjectId, Box<crate::Data>);
-    fn command_encoder_end_compute_pass(
-        &self,
-        encoder: &ObjectId,
-        encoder_data: &crate::Data,
-        pass: &mut ObjectId,
-        pass_data: &mut crate::Data,
-    );
     fn command_encoder_begin_render_pass(
         &self,
         encoder: &ObjectId,
         encoder_data: &crate::Data,
-        desc: &RenderPassDescriptor<'_, '_>,
+        desc: &RenderPassDescriptor<'_>,
     ) -> (ObjectId, Box<crate::Data>);
-    fn command_encoder_end_render_pass(
-        &self,
-        encoder: &ObjectId,
-        encoder_data: &crate::Data,
-        pass: &mut ObjectId,
-        pass_data: &mut crate::Data,
-    );
     fn command_encoder_finish(
         &self,
         encoder: ObjectId,
@@ -1630,7 +1619,7 @@ pub(crate) trait DynContext: Debug + WasmNotSendSync {
         queue: &ObjectId,
         queue_data: &crate::Data,
         command_buffers: &mut dyn Iterator<Item = (ObjectId, Box<crate::Data>)>,
-    ) -> (ObjectId, Arc<crate::Data>);
+    ) -> Arc<crate::Data>;
     fn queue_get_timestamp_period(&self, queue: &ObjectId, queue_data: &crate::Data) -> f32;
     fn queue_on_submitted_work_done(
         &self,
@@ -1641,6 +1630,18 @@ pub(crate) trait DynContext: Debug + WasmNotSendSync {
 
     fn device_start_capture(&self, device: &ObjectId, data: &crate::Data);
     fn device_stop_capture(&self, device: &ObjectId, data: &crate::Data);
+
+    fn device_get_internal_counters(
+        &self,
+        device: &ObjectId,
+        device_data: &crate::Data,
+    ) -> wgt::InternalCounters;
+
+    fn generate_allocator_report(
+        &self,
+        device: &ObjectId,
+        device_data: &crate::Data,
+    ) -> Option<wgt::AllocatorReport>;
 
     fn pipeline_cache_get_data(
         &self,
@@ -1721,6 +1722,7 @@ pub(crate) trait DynContext: Debug + WasmNotSendSync {
         indirect_buffer_data: &crate::Data,
         indirect_offset: BufferAddress,
     );
+    fn compute_pass_end(&self, pass: &mut ObjectId, pass_data: &mut crate::Data);
 
     fn render_bundle_encoder_set_pipeline(
         &self,
@@ -2045,6 +2047,7 @@ pub(crate) trait DynContext: Debug + WasmNotSendSync {
         pass_data: &mut crate::Data,
         render_bundles: &mut dyn Iterator<Item = (&ObjectId, &crate::Data)>,
     );
+    fn render_pass_end(&self, pass: &mut ObjectId, pass_data: &mut crate::Data);
 }
 
 // Blanket impl of DynContext for all types which implement Context.
@@ -2837,51 +2840,17 @@ where
         (compute_pass.into(), Box::new(data) as _)
     }
 
-    fn command_encoder_end_compute_pass(
-        &self,
-        encoder: &ObjectId,
-        encoder_data: &crate::Data,
-        pass: &mut ObjectId,
-        pass_data: &mut crate::Data,
-    ) {
-        let encoder = <T::CommandEncoderId>::from(*encoder);
-        let encoder_data = downcast_ref(encoder_data);
-        let mut pass = <T::ComputePassId>::from(*pass);
-        let pass_data = downcast_mut(pass_data);
-        Context::command_encoder_end_compute_pass(
-            self,
-            &encoder,
-            encoder_data,
-            &mut pass,
-            pass_data,
-        )
-    }
-
     fn command_encoder_begin_render_pass(
         &self,
         encoder: &ObjectId,
         encoder_data: &crate::Data,
-        desc: &RenderPassDescriptor<'_, '_>,
+        desc: &RenderPassDescriptor<'_>,
     ) -> (ObjectId, Box<crate::Data>) {
         let encoder = <T::CommandEncoderId>::from(*encoder);
         let encoder_data = downcast_ref(encoder_data);
         let (render_pass, data) =
             Context::command_encoder_begin_render_pass(self, &encoder, encoder_data, desc);
         (render_pass.into(), Box::new(data) as _)
-    }
-
-    fn command_encoder_end_render_pass(
-        &self,
-        encoder: &ObjectId,
-        encoder_data: &crate::Data,
-        pass: &mut ObjectId,
-        pass_data: &mut crate::Data,
-    ) {
-        let encoder = <T::CommandEncoderId>::from(*encoder);
-        let encoder_data = downcast_ref(encoder_data);
-        let mut pass = <T::RenderPassId>::from(*pass);
-        let pass_data = downcast_mut(pass_data);
-        Context::command_encoder_end_render_pass(self, &encoder, encoder_data, &mut pass, pass_data)
     }
 
     fn command_encoder_finish(
@@ -3127,16 +3096,15 @@ where
         queue: &ObjectId,
         queue_data: &crate::Data,
         command_buffers: &mut dyn Iterator<Item = (ObjectId, Box<crate::Data>)>,
-    ) -> (ObjectId, Arc<crate::Data>) {
+    ) -> Arc<crate::Data> {
         let queue = <T::QueueId>::from(*queue);
         let queue_data = downcast_ref(queue_data);
         let command_buffers = command_buffers.map(|(id, data)| {
             let command_buffer_data: <T as Context>::CommandBufferData = *data.downcast().unwrap();
             (<T::CommandBufferId>::from(id), command_buffer_data)
         });
-        let (submission_index, data) =
-            Context::queue_submit(self, &queue, queue_data, command_buffers);
-        (submission_index.into(), Arc::new(data) as _)
+        let data = Context::queue_submit(self, &queue, queue_data, command_buffers);
+        Arc::new(data) as _
     }
 
     fn queue_get_timestamp_period(&self, queue: &ObjectId, queue_data: &crate::Data) -> f32 {
@@ -3166,6 +3134,26 @@ where
         let device = <T::DeviceId>::from(*device);
         let device_data = downcast_ref(device_data);
         Context::device_stop_capture(self, &device, device_data)
+    }
+
+    fn device_get_internal_counters(
+        &self,
+        device: &ObjectId,
+        device_data: &crate::Data,
+    ) -> wgt::InternalCounters {
+        let device = <T::DeviceId>::from(*device);
+        let device_data = downcast_ref(device_data);
+        Context::device_get_internal_counters(self, &device, device_data)
+    }
+
+    fn generate_allocator_report(
+        &self,
+        device: &ObjectId,
+        device_data: &crate::Data,
+    ) -> Option<wgt::AllocatorReport> {
+        let device = <T::DeviceId>::from(*device);
+        let device_data = downcast_ref(device_data);
+        Context::device_generate_allocator_report(self, &device, device_data)
     }
 
     fn pipeline_cache_get_data(
@@ -3343,6 +3331,12 @@ where
             indirect_buffer_data,
             indirect_offset,
         )
+    }
+
+    fn compute_pass_end(&self, pass: &mut ObjectId, pass_data: &mut crate::Data) {
+        let mut pass = <T::ComputePassId>::from(*pass);
+        let pass_data = downcast_mut(pass_data);
+        Context::compute_pass_end(self, &mut pass, pass_data)
     }
 
     fn render_bundle_encoder_set_pipeline(
@@ -4106,6 +4100,12 @@ where
             (<T::RenderBundleId>::from(*id), render_bundle_data)
         });
         Context::render_pass_execute_bundles(self, &mut pass, pass_data, &mut render_bundles)
+    }
+
+    fn render_pass_end(&self, pass: &mut ObjectId, pass_data: &mut crate::Data) {
+        let mut pass = <T::RenderPassId>::from(*pass);
+        let pass_data = downcast_mut(pass_data);
+        Context::render_pass_end(self, &mut pass, pass_data)
     }
 }
 

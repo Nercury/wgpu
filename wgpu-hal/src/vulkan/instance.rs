@@ -23,7 +23,7 @@ unsafe extern "system" fn debug_utils_messenger_callback(
     }
 
     let cd = unsafe { &*callback_data_ptr };
-    let user_data = unsafe { &*(user_data as *mut super::DebugUtilsMessengerUserData) };
+    let user_data = unsafe { &*user_data.cast::<super::DebugUtilsMessengerUserData>() };
 
     const VUID_VKCMDENDDEBUGUTILSLABELEXT_COMMANDBUFFER_01912: i32 = 0x56146426;
     if cd.message_id_number == VUID_VKCMDENDDEBUGUTILSLABELEXT_COMMANDBUFFER_01912 {
@@ -164,10 +164,14 @@ impl super::Swapchain {
             let _ = unsafe { device.device_wait_idle() };
         };
 
+        // We cannot take this by value, as the function returns `self`.
         for semaphore in self.surface_semaphores.drain(..) {
-            unsafe {
-                device.destroy_semaphore(semaphore, None);
-            }
+            let arc_removed = Arc::into_inner(semaphore).expect(
+                "Trying to destroy a SurfaceSemaphores that is still in use by a SurfaceTexture",
+            );
+            let mutex_removed = arc_removed.into_inner();
+
+            unsafe { mutex_removed.destroy(device) };
         }
 
         self
@@ -511,7 +515,7 @@ impl super::Instance {
         }
 
         let layer = unsafe {
-            crate::metal::Surface::get_metal_layer(view as *mut objc::runtime::Object, None)
+            crate::metal::Surface::get_metal_layer(view.cast::<objc::runtime::Object>(), None)
         };
 
         let surface = {
@@ -519,7 +523,7 @@ impl super::Instance {
                 ext::metal_surface::Instance::new(&self.shared.entry, &self.shared.raw);
             let vk_info = vk::MetalSurfaceCreateInfoEXT::default()
                 .flags(vk::MetalSurfaceCreateFlagsEXT::empty())
-                .layer(layer as *mut _);
+                .layer(layer.cast());
 
             unsafe { metal_loader.create_metal_surface(&vk_info, None).unwrap() }
         };
@@ -876,11 +880,10 @@ impl crate::Instance for super::Instance {
         }
     }
 
-    unsafe fn destroy_surface(&self, surface: super::Surface) {
-        unsafe { surface.functor.destroy_surface(surface.raw, None) };
-    }
-
-    unsafe fn enumerate_adapters(&self) -> Vec<crate::ExposedAdapter<super::Api>> {
+    unsafe fn enumerate_adapters(
+        &self,
+        _surface_hint: Option<&super::Surface>,
+    ) -> Vec<crate::ExposedAdapter<super::Api>> {
         use crate::auxil::db;
 
         let raw_devices = match unsafe { self.shared.raw.enumerate_physical_devices() } {
@@ -935,6 +938,12 @@ impl crate::Instance for super::Instance {
     }
 }
 
+impl Drop for super::Surface {
+    fn drop(&mut self) {
+        unsafe { self.functor.destroy_surface(self.raw, None) };
+    }
+}
+
 impl crate::Surface for super::Surface {
     type A = super::Api;
 
@@ -943,7 +952,7 @@ impl crate::Surface for super::Surface {
         device: &super::Device,
         config: &crate::SurfaceConfiguration,
     ) -> Result<(), crate::SurfaceError> {
-        // Safety: `configure`'s contract guarantees there are no resources derived from the swapchain in use.
+        // SAFETY: `configure`'s contract guarantees there are no resources derived from the swapchain in use.
         let mut swap_chain = self.swapchain.write();
         let old = swap_chain
             .take()
@@ -957,7 +966,7 @@ impl crate::Surface for super::Surface {
 
     unsafe fn unconfigure(&self, device: &super::Device) {
         if let Some(sc) = self.swapchain.write().take() {
-            // Safety: `unconfigure`'s contract guarantees there are no resources derived from the swapchain in use.
+            // SAFETY: `unconfigure`'s contract guarantees there are no resources derived from the swapchain in use.
             let swapchain = unsafe { sc.release_resources(&device.shared.raw) };
             unsafe { swapchain.functor.destroy_swapchain(swapchain.raw, None) };
         }
@@ -966,9 +975,10 @@ impl crate::Surface for super::Surface {
     unsafe fn acquire_texture(
         &self,
         timeout: Option<std::time::Duration>,
+        fence: &super::Fence,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<super::Api>>, crate::SurfaceError> {
         let mut swapchain = self.swapchain.write();
-        let sc = swapchain.as_mut().unwrap();
+        let swapchain = swapchain.as_mut().unwrap();
 
         let mut timeout_ns = match timeout {
             Some(duration) => duration.as_nanos() as u64,
@@ -988,12 +998,40 @@ impl crate::Surface for super::Surface {
             timeout_ns = u64::MAX;
         }
 
-        let wait_semaphore = sc.surface_semaphores[sc.next_surface_index];
+        let swapchain_semaphores_arc = swapchain.get_surface_semaphores();
+        // Nothing should be using this, so we don't block, but panic if we fail to lock.
+        let locked_swapchain_semaphores = swapchain_semaphores_arc
+            .try_lock()
+            .expect("Failed to lock a SwapchainSemaphores.");
+
+        // Wait for all commands writing to the previously acquired image to
+        // complete.
+        //
+        // Almost all the steps in the usual acquire-draw-present flow are
+        // asynchronous: they get something started on the presentation engine
+        // or the GPU, but on the CPU, control returns immediately. Without some
+        // sort of intervention, the CPU could crank out frames much faster than
+        // the presentation engine can display them.
+        //
+        // This is the intervention: if any submissions drew on this image, and
+        // thus waited for `locked_swapchain_semaphores.acquire`, wait for all
+        // of them to finish, thus ensuring that it's okay to pass `acquire` to
+        // `vkAcquireNextImageKHR` again.
+        swapchain.device.wait_for_fence(
+            fence,
+            locked_swapchain_semaphores.previously_used_submission_index,
+            timeout_ns,
+        )?;
 
         // will block if no image is available
         let (index, suboptimal) = match unsafe {
-            sc.functor
-                .acquire_next_image(sc.raw, timeout_ns, wait_semaphore, vk::Fence::null())
+            profiling::scope!("vkAcquireNextImageKHR");
+            swapchain.functor.acquire_next_image(
+                swapchain.raw,
+                timeout_ns,
+                locked_swapchain_semaphores.acquire,
+                vk::Fence::null(),
+            )
         } {
             // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
             // See the comment in `Queue::present`.
@@ -1013,16 +1051,18 @@ impl crate::Surface for super::Surface {
             }
         };
 
-        sc.next_surface_index += 1;
-        sc.next_surface_index %= sc.surface_semaphores.len();
+        drop(locked_swapchain_semaphores);
+        // We only advance the surface semaphores if we successfully acquired an image, otherwise
+        // we should try to re-acquire using the same semaphores.
+        swapchain.advance_surface_semaphores();
 
         // special case for Intel Vulkan returning bizarre values (ugh)
-        if sc.device.vendor_id == crate::auxil::db::intel::VENDOR && index > 0x100 {
+        if swapchain.device.vendor_id == crate::auxil::db::intel::VENDOR && index > 0x100 {
             return Err(crate::SurfaceError::Outdated);
         }
 
         // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkRenderPassBeginInfo.html#VUID-VkRenderPassBeginInfo-framebuffer-03209
-        let raw_flags = if sc
+        let raw_flags = if swapchain
             .raw_flags
             .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
         {
@@ -1034,20 +1074,20 @@ impl crate::Surface for super::Surface {
         let texture = super::SurfaceTexture {
             index,
             texture: super::Texture {
-                raw: sc.images[index as usize],
+                raw: swapchain.images[index as usize],
                 drop_guard: None,
                 block: None,
-                usage: sc.config.usage,
-                format: sc.config.format,
+                usage: swapchain.config.usage,
+                format: swapchain.config.format,
                 raw_flags,
                 copy_size: crate::CopyExtent {
-                    width: sc.config.extent.width,
-                    height: sc.config.extent.height,
+                    width: swapchain.config.extent.width,
+                    height: swapchain.config.extent.height,
                     depth: 1,
                 },
-                view_formats: sc.view_formats.clone(),
+                view_formats: swapchain.view_formats.clone(),
             },
-            wait_semaphore,
+            surface_semaphores: swapchain_semaphores_arc,
         };
         Ok(Some(crate::AcquiredSurfaceTexture {
             texture,

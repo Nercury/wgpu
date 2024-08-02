@@ -53,8 +53,10 @@ impl crate::Instance for Context {
     ) -> Result<Context, crate::InstanceError> {
         Ok(Context)
     }
-    unsafe fn destroy_surface(&self, surface: Context) {}
-    unsafe fn enumerate_adapters(&self) -> Vec<crate::ExposedAdapter<Api>> {
+    unsafe fn enumerate_adapters(
+        &self,
+        _surface_hint: Option<&Context>,
+    ) -> Vec<crate::ExposedAdapter<Api>> {
         Vec::new()
     }
 }
@@ -75,6 +77,7 @@ impl crate::Surface for Context {
     unsafe fn acquire_texture(
         &self,
         timeout: Option<std::time::Duration>,
+        fence: &Resource,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<Api>>, crate::SurfaceError> {
         Ok(None)
     }
@@ -88,6 +91,7 @@ impl crate::Adapter for Context {
         &self,
         features: wgt::Features,
         _limits: &wgt::Limits,
+        _memory_hints: &wgt::MemoryHints,
     ) -> DeviceResult<crate::OpenDevice<Api>> {
         Err(crate::DeviceError::Lost)
     }
@@ -114,7 +118,7 @@ impl crate::Queue for Context {
         &self,
         command_buffers: &[&Resource],
         surface_textures: &[&Resource],
-        signal_fence: Option<(&mut Resource, crate::FenceValue)>,
+        signal_fence: (&mut Resource, crate::FenceValue),
     ) -> DeviceResult<()> {
         Ok(())
     }
@@ -146,9 +150,7 @@ impl crate::Device for Context {
     ) -> DeviceResult<crate::BufferMapping> {
         Err(crate::DeviceError::Lost)
     }
-    unsafe fn unmap_buffer(&self, buffer: &Resource) -> DeviceResult<()> {
-        Ok(())
-    }
+    unsafe fn unmap_buffer(&self, buffer: &Resource) {}
     unsafe fn flush_mapped_ranges<I>(&self, buffer: &Resource, ranges: I) {}
     unsafe fn invalidate_mapped_ranges<I>(&self, buffer: &Resource, ranges: I) {}
 
@@ -275,6 +277,10 @@ impl crate::Device for Context {
         Default::default()
     }
     unsafe fn destroy_acceleration_structure(&self, _acceleration_structure: Resource) {}
+
+    fn get_internal_counters(&self) -> wgt::HalCounters {
+        Default::default()
+    }
 }
 
 impl crate::CommandEncoder for Encoder {

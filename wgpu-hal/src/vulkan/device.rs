@@ -312,7 +312,10 @@ impl gpu_alloc::MemoryDevice<vk::DeviceMemory> for super::DeviceShared {
         }
 
         match unsafe { self.raw.allocate_memory(&info, None) } {
-            Ok(memory) => Ok(memory),
+            Ok(memory) => {
+                self.memory_allocations_counter.add(1);
+                Ok(memory)
+            }
             Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
                 Err(gpu_alloc::OutOfMemory::OutOfDeviceMemory)
             }
@@ -325,6 +328,8 @@ impl gpu_alloc::MemoryDevice<vk::DeviceMemory> for super::DeviceShared {
     }
 
     unsafe fn deallocate_memory(&self, memory: vk::DeviceMemory) {
+        self.memory_allocations_counter.sub(1);
+
         unsafe { self.raw.free_memory(memory, None) };
     }
 
@@ -338,7 +343,7 @@ impl gpu_alloc::MemoryDevice<vk::DeviceMemory> for super::DeviceShared {
             self.raw
                 .map_memory(*memory, offset, size, vk::MemoryMapFlags::empty())
         } {
-            Ok(ptr) => Ok(ptr::NonNull::new(ptr as *mut u8)
+            Ok(ptr) => Ok(ptr::NonNull::new(ptr.cast::<u8>())
                 .expect("Pointer to memory mapping must not be null")),
             Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
                 Err(gpu_alloc::DeviceMapError::OutOfDeviceMemory)
@@ -612,17 +617,16 @@ impl super::Device {
         let images =
             unsafe { functor.get_swapchain_images(raw) }.map_err(crate::DeviceError::from)?;
 
-        // NOTE: It's important that we define at least images.len() + 1 wait
+        // NOTE: It's important that we define at least images.len() wait
         // semaphores, since we prospectively need to provide the call to
         // acquire the next image with an unsignaled semaphore.
-        let surface_semaphores = (0..images.len() + 1)
-            .map(|_| unsafe {
-                self.shared
-                    .raw
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        let surface_semaphores = (0..=images.len())
+            .map(|_| {
+                super::SwapchainImageSemaphores::new(&self.shared)
+                    .map(Mutex::new)
+                    .map(Arc::new)
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(crate::DeviceError::from)?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(super::Swapchain {
             raw,
@@ -633,7 +637,7 @@ impl super::Device {
             config: config.clone(),
             view_formats: wgt_view_formats,
             surface_semaphores,
-            next_surface_index: 0,
+            next_semaphore_index: 0,
         })
     }
 
@@ -732,7 +736,6 @@ impl super::Device {
                             index: naga::proc::BoundsCheckPolicy::Unchecked,
                             buffer: naga::proc::BoundsCheckPolicy::Unchecked,
                             image_load: naga::proc::BoundsCheckPolicy::Unchecked,
-                            image_store: naga::proc::BoundsCheckPolicy::Unchecked,
                             binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
                         };
                     }
@@ -836,9 +839,12 @@ impl crate::Device for super::Device {
     unsafe fn exit(self, queue: super::Queue) {
         unsafe { self.mem_allocator.into_inner().cleanup(&*self.shared) };
         unsafe { self.desc_allocator.into_inner().cleanup(&*self.shared) };
-        for &sem in queue.relay_semaphores.iter() {
-            unsafe { self.shared.raw.destroy_semaphore(sem, None) };
-        }
+        unsafe {
+            queue
+                .relay_semaphores
+                .into_inner()
+                .destroy(&self.shared.raw)
+        };
         unsafe { self.shared.free_resources() };
     }
 
@@ -908,6 +914,9 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
+        self.counters.buffer_memory.add(block.size() as isize);
+        self.counters.buffers.add(1);
+
         Ok(super::Buffer {
             raw,
             block: Some(Mutex::new(block)),
@@ -916,12 +925,12 @@ impl crate::Device for super::Device {
     unsafe fn destroy_buffer(&self, buffer: super::Buffer) {
         unsafe { self.shared.raw.destroy_buffer(buffer.raw, None) };
         if let Some(block) = buffer.block {
-            unsafe {
-                self.mem_allocator
-                    .lock()
-                    .dealloc(&*self.shared, block.into_inner())
-            };
+            let block = block.into_inner();
+            self.counters.buffer_memory.sub(block.size() as isize);
+            unsafe { self.mem_allocator.lock().dealloc(&*self.shared, block) };
         }
+
+        self.counters.buffers.sub(1);
     }
 
     unsafe fn map_buffer(
@@ -941,12 +950,10 @@ impl crate::Device for super::Device {
             Err(crate::DeviceError::OutOfMemory)
         }
     }
-    unsafe fn unmap_buffer(&self, buffer: &super::Buffer) -> Result<(), crate::DeviceError> {
+    unsafe fn unmap_buffer(&self, buffer: &super::Buffer) {
+        // We can only unmap the buffer if it was already mapped successfully.
         if let Some(ref block) = buffer.block {
             unsafe { block.lock().unmap(&*self.shared) };
-            Ok(())
-        } else {
-            Err(crate::DeviceError::OutOfMemory)
         }
     }
 
@@ -1047,6 +1054,8 @@ impl crate::Device for super::Device {
             )?
         };
 
+        self.counters.texture_memory.add(block.size() as isize);
+
         unsafe {
             self.shared
                 .raw
@@ -1056,6 +1065,8 @@ impl crate::Device for super::Device {
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
         }
+
+        self.counters.textures.add(1);
 
         Ok(super::Texture {
             raw,
@@ -1073,8 +1084,12 @@ impl crate::Device for super::Device {
             unsafe { self.shared.raw.destroy_image(texture.raw, None) };
         }
         if let Some(block) = texture.block {
+            self.counters.texture_memory.sub(block.size() as isize);
+
             unsafe { self.mem_allocator.lock().dealloc(&*self.shared, block) };
         }
+
+        self.counters.textures.sub(1);
     }
 
     unsafe fn create_texture_view(
@@ -1124,6 +1139,8 @@ impl crate::Device for super::Device {
                 .collect(),
         };
 
+        self.counters.texture_views.add(1);
+
         Ok(super::TextureView {
             raw,
             layers,
@@ -1141,6 +1158,8 @@ impl crate::Device for super::Device {
             fbuf_lock.retain(|key, _| !key.attachments.iter().any(|at| at.raw == view.raw));
         }
         unsafe { self.shared.raw.destroy_image_view(view.raw, None) };
+
+        self.counters.texture_views.sub(1);
     }
 
     unsafe fn create_sampler(
@@ -1182,10 +1201,14 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
+        self.counters.samplers.add(1);
+
         Ok(super::Sampler { raw })
     }
     unsafe fn destroy_sampler(&self, sampler: super::Sampler) {
         unsafe { self.shared.raw.destroy_sampler(sampler.raw, None) };
+
+        self.counters.samplers.sub(1);
     }
 
     unsafe fn create_command_encoder(
@@ -1196,6 +1219,8 @@ impl crate::Device for super::Device {
             .queue_family_index(desc.queue.family_index)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
         let raw = unsafe { self.shared.raw.create_command_pool(&vk_info, None)? };
+
+        self.counters.command_encoders.add(1);
 
         Ok(super::CommandEncoder {
             raw,
@@ -1217,6 +1242,8 @@ impl crate::Device for super::Device {
             // fields.
             self.shared.raw.destroy_command_pool(cmd_encoder.raw, None);
         }
+
+        self.counters.command_encoders.sub(1);
     }
 
     unsafe fn create_bind_group_layout(
@@ -1337,6 +1364,8 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
+        self.counters.bind_group_layouts.add(1);
+
         Ok(super::BindGroupLayout {
             raw,
             desc_count,
@@ -1350,6 +1379,8 @@ impl crate::Device for super::Device {
                 .raw
                 .destroy_descriptor_set_layout(bg_layout.raw, None)
         };
+
+        self.counters.bind_group_layouts.sub(1);
     }
 
     unsafe fn create_pipeline_layout(
@@ -1401,6 +1432,8 @@ impl crate::Device for super::Device {
             }
         }
 
+        self.counters.pipeline_layouts.add(1);
+
         Ok(super::PipelineLayout {
             raw,
             binding_arrays,
@@ -1412,6 +1445,8 @@ impl crate::Device for super::Device {
                 .raw
                 .destroy_pipeline_layout(pipeline_layout.raw, None)
         };
+
+        self.counters.pipeline_layouts.sub(1);
     }
 
     unsafe fn create_bind_group(
@@ -1477,7 +1512,7 @@ impl crate::Device for super::Device {
                     // SAFETY: similar to safety notes for `slice_get_ref`, but we have a
                     // mutable reference which is also guaranteed to be valid for writes.
                     unsafe {
-                        &mut *(to_init as *mut [MaybeUninit<T>] as *mut [T])
+                        &mut *(ptr::from_mut::<[MaybeUninit<T>]>(to_init) as *mut [T])
                     }
                 };
                 (Self { remainder }, init)
@@ -1594,14 +1629,20 @@ impl crate::Device for super::Device {
         }
 
         unsafe { self.shared.raw.update_descriptor_sets(&writes, &[]) };
+
+        self.counters.bind_groups.add(1);
+
         Ok(super::BindGroup { set })
     }
+
     unsafe fn destroy_bind_group(&self, group: super::BindGroup) {
         unsafe {
             self.desc_allocator
                 .lock()
                 .free(&*self.shared, Some(group.set))
         };
+
+        self.counters.bind_groups.sub(1);
     }
 
     unsafe fn create_shader_module(
@@ -1636,7 +1677,6 @@ impl crate::Device for super::Device {
                         index: naga::proc::BoundsCheckPolicy::Unchecked,
                         buffer: naga::proc::BoundsCheckPolicy::Unchecked,
                         image_load: naga::proc::BoundsCheckPolicy::Unchecked,
-                        image_store: naga::proc::BoundsCheckPolicy::Unchecked,
                         binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
                     };
                 }
@@ -1659,8 +1699,11 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
+        self.counters.shader_modules.add(1);
+
         Ok(super::ShaderModule::Raw(raw))
     }
+
     unsafe fn destroy_shader_module(&self, module: super::ShaderModule) {
         match module {
             super::ShaderModule::Raw(raw) => {
@@ -1668,6 +1711,8 @@ impl crate::Device for super::Device {
             }
             super::ShaderModule::Intermediate { .. } => {}
         }
+
+        self.counters.shader_modules.sub(1);
     }
 
     unsafe fn create_render_pipeline(
@@ -1898,10 +1943,14 @@ impl crate::Device for super::Device {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
         }
 
+        self.counters.render_pipelines.add(1);
+
         Ok(super::RenderPipeline { raw })
     }
     unsafe fn destroy_render_pipeline(&self, pipeline: super::RenderPipeline) {
         unsafe { self.shared.raw.destroy_pipeline(pipeline.raw, None) };
+
+        self.counters.render_pipelines.sub(1);
     }
 
     unsafe fn create_compute_pipeline(
@@ -1944,10 +1993,15 @@ impl crate::Device for super::Device {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
         }
 
+        self.counters.compute_pipelines.add(1);
+
         Ok(super::ComputePipeline { raw })
     }
+
     unsafe fn destroy_compute_pipeline(&self, pipeline: super::ComputePipeline) {
         unsafe { self.shared.raw.destroy_pipeline(pipeline.raw, None) };
+
+        self.counters.compute_pipelines.sub(1);
     }
 
     unsafe fn create_pipeline_cache(
@@ -1999,18 +2053,26 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
+        self.counters.query_sets.add(1);
+
         Ok(super::QuerySet { raw })
     }
+
     unsafe fn destroy_query_set(&self, set: super::QuerySet) {
         unsafe { self.shared.raw.destroy_query_pool(set.raw, None) };
+
+        self.counters.query_sets.sub(1);
     }
 
     unsafe fn create_fence(&self) -> Result<super::Fence, crate::DeviceError> {
+        self.counters.fences.add(1);
+
         Ok(if self.shared.private_caps.timeline_semaphores {
             let mut sem_type_info =
                 vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
             let vk_info = vk::SemaphoreCreateInfo::default().push_next(&mut sem_type_info);
             let raw = unsafe { self.shared.raw.create_semaphore(&vk_info, None) }?;
+
             super::Fence::TimelineSemaphore(raw)
         } else {
             super::Fence::FencePool {
@@ -2038,6 +2100,8 @@ impl crate::Device for super::Device {
                 }
             }
         }
+
+        self.counters.fences.sub(1);
     }
     unsafe fn get_fence_value(
         &self,
@@ -2055,54 +2119,7 @@ impl crate::Device for super::Device {
         timeout_ms: u32,
     ) -> Result<bool, crate::DeviceError> {
         let timeout_ns = timeout_ms as u64 * super::MILLIS_TO_NANOS;
-        match *fence {
-            super::Fence::TimelineSemaphore(raw) => {
-                let semaphores = [raw];
-                let values = [wait_value];
-                let vk_info = vk::SemaphoreWaitInfo::default()
-                    .semaphores(&semaphores)
-                    .values(&values);
-                let result = match self.shared.extension_fns.timeline_semaphore {
-                    Some(super::ExtensionFn::Extension(ref ext)) => unsafe {
-                        ext.wait_semaphores(&vk_info, timeout_ns)
-                    },
-                    Some(super::ExtensionFn::Promoted) => unsafe {
-                        self.shared.raw.wait_semaphores(&vk_info, timeout_ns)
-                    },
-                    None => unreachable!(),
-                };
-                match result {
-                    Ok(()) => Ok(true),
-                    Err(vk::Result::TIMEOUT) => Ok(false),
-                    Err(other) => Err(other.into()),
-                }
-            }
-            super::Fence::FencePool {
-                last_completed,
-                ref active,
-                free: _,
-            } => {
-                if wait_value <= last_completed {
-                    Ok(true)
-                } else {
-                    match active.iter().find(|&&(value, _)| value >= wait_value) {
-                        Some(&(_, raw)) => {
-                            match unsafe {
-                                self.shared.raw.wait_for_fences(&[raw], true, timeout_ns)
-                            } {
-                                Ok(()) => Ok(true),
-                                Err(vk::Result::TIMEOUT) => Ok(false),
-                                Err(other) => Err(other.into()),
-                            }
-                        }
-                        None => {
-                            log::error!("No signals reached value {}", wait_value);
-                            Err(crate::DeviceError::Lost)
-                        }
-                    }
-                }
-            }
-        }
+        self.shared.wait_for_fence(fence, wait_value, timeout_ns)
     }
 
     unsafe fn start_capture(&self) -> bool {
@@ -2291,7 +2308,10 @@ impl crate::Device for super::Device {
 
         let vk_buffer_info = vk::BufferCreateInfo::default()
             .size(desc.size)
-            .usage(vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR)
+            .usage(
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         unsafe {
@@ -2360,6 +2380,79 @@ impl crate::Device for super::Device {
             self.mem_allocator
                 .lock()
                 .dealloc(&*self.shared, acceleration_structure.block.into_inner());
+        }
+    }
+
+    fn get_internal_counters(&self) -> wgt::HalCounters {
+        self.counters
+            .memory_allocations
+            .set(self.shared.memory_allocations_counter.read());
+
+        self.counters.clone()
+    }
+}
+
+impl super::DeviceShared {
+    pub(super) fn new_binary_semaphore(&self) -> Result<vk::Semaphore, crate::DeviceError> {
+        unsafe {
+            self.raw
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .map_err(crate::DeviceError::from)
+        }
+    }
+
+    pub(super) fn wait_for_fence(
+        &self,
+        fence: &super::Fence,
+        wait_value: crate::FenceValue,
+        timeout_ns: u64,
+    ) -> Result<bool, crate::DeviceError> {
+        profiling::scope!("Device::wait");
+        match *fence {
+            super::Fence::TimelineSemaphore(raw) => {
+                let semaphores = [raw];
+                let values = [wait_value];
+                let vk_info = vk::SemaphoreWaitInfo::default()
+                    .semaphores(&semaphores)
+                    .values(&values);
+                let result = match self.extension_fns.timeline_semaphore {
+                    Some(super::ExtensionFn::Extension(ref ext)) => unsafe {
+                        ext.wait_semaphores(&vk_info, timeout_ns)
+                    },
+                    Some(super::ExtensionFn::Promoted) => unsafe {
+                        self.raw.wait_semaphores(&vk_info, timeout_ns)
+                    },
+                    None => unreachable!(),
+                };
+                match result {
+                    Ok(()) => Ok(true),
+                    Err(vk::Result::TIMEOUT) => Ok(false),
+                    Err(other) => Err(other.into()),
+                }
+            }
+            super::Fence::FencePool {
+                last_completed,
+                ref active,
+                free: _,
+            } => {
+                if wait_value <= last_completed {
+                    Ok(true)
+                } else {
+                    match active.iter().find(|&&(value, _)| value >= wait_value) {
+                        Some(&(_, raw)) => {
+                            match unsafe { self.raw.wait_for_fences(&[raw], true, timeout_ns) } {
+                                Ok(()) => Ok(true),
+                                Err(vk::Result::TIMEOUT) => Ok(false),
+                                Err(other) => Err(other.into()),
+                            }
+                        }
+                        None => {
+                            log::error!("No signals reached value {}", wait_value);
+                            Err(crate::DeviceError::Lost)
+                        }
+                    }
+                }
+            }
         }
     }
 }

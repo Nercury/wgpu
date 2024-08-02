@@ -919,7 +919,10 @@ impl crate::Instance for Instance {
 
                 let ret = unsafe {
                     ndk_sys::ANativeWindow_setBuffersGeometry(
-                        handle.a_native_window.as_ptr() as *mut ndk_sys::ANativeWindow,
+                        handle
+                            .a_native_window
+                            .as_ptr()
+                            .cast::<ndk_sys::ANativeWindow>(),
                         0,
                         0,
                         format,
@@ -999,9 +1002,10 @@ impl crate::Instance for Instance {
         })
     }
 
-    unsafe fn destroy_surface(&self, _surface: Surface) {}
-
-    unsafe fn enumerate_adapters(&self) -> Vec<crate::ExposedAdapter<super::Api>> {
+    unsafe fn enumerate_adapters(
+        &self,
+        _surface_hint: Option<&Surface>,
+    ) -> Vec<crate::ExposedAdapter<super::Api>> {
         let inner = self.inner.lock();
         inner.egl.make_current();
 
@@ -1226,17 +1230,15 @@ impl crate::Surface for Surface {
                 let native_window_ptr = match (self.wsi.kind, self.raw_window_handle) {
                     (WindowKind::Unknown | WindowKind::X11, Rwh::Xlib(handle)) => {
                         temp_xlib_handle = handle.window;
-                        &mut temp_xlib_handle as *mut _ as *mut std::ffi::c_void
+                        ptr::from_mut(&mut temp_xlib_handle).cast::<ffi::c_void>()
                     }
-                    (WindowKind::AngleX11, Rwh::Xlib(handle)) => {
-                        handle.window as *mut std::ffi::c_void
-                    }
+                    (WindowKind::AngleX11, Rwh::Xlib(handle)) => handle.window as *mut ffi::c_void,
                     (WindowKind::Unknown | WindowKind::X11, Rwh::Xcb(handle)) => {
                         temp_xcb_handle = handle.window;
-                        &mut temp_xcb_handle as *mut _ as *mut std::ffi::c_void
+                        ptr::from_mut(&mut temp_xcb_handle).cast::<ffi::c_void>()
                     }
                     (WindowKind::AngleX11, Rwh::Xcb(handle)) => {
-                        handle.window.get() as *mut std::ffi::c_void
+                        handle.window.get() as *mut ffi::c_void
                     }
                     (WindowKind::Unknown, Rwh::AndroidNdk(handle)) => {
                         handle.a_native_window.as_ptr()
@@ -1247,14 +1249,14 @@ impl crate::Surface for Surface {
                             unsafe { library.get(b"wl_egl_window_create") }.unwrap();
                         let window =
                             unsafe { wl_egl_window_create(handle.surface.as_ptr(), 640, 480) }
-                                as *mut _;
+                                .cast();
                         wl_window = Some(window);
                         window
                     }
                     #[cfg(Emscripten)]
-                    (WindowKind::Unknown, Rwh::Web(handle)) => handle.id as *mut std::ffi::c_void,
+                    (WindowKind::Unknown, Rwh::Web(handle)) => handle.id as *mut ffi::c_void,
                     (WindowKind::Unknown, Rwh::Win32(handle)) => {
-                        handle.hwnd.get() as *mut std::ffi::c_void
+                        handle.hwnd.get() as *mut ffi::c_void
                     }
                     (WindowKind::Unknown, Rwh::AppKit(handle)) => {
                         #[cfg(not(target_os = "macos"))]
@@ -1264,8 +1266,8 @@ impl crate::Surface for Surface {
                             use objc::{msg_send, runtime::Object, sel, sel_impl};
                             // ns_view always have a layer and don't need to verify that it exists.
                             let layer: *mut Object =
-                                msg_send![handle.ns_view.as_ptr() as *mut Object, layer];
-                            layer as *mut ffi::c_void
+                                msg_send![handle.ns_view.as_ptr().cast::<Object>(), layer];
+                            layer.cast::<ffi::c_void>()
                         };
                         window_ptr
                     }
@@ -1434,6 +1436,7 @@ impl crate::Surface for Surface {
     unsafe fn acquire_texture(
         &self,
         _timeout_ms: Option<Duration>, //TODO
+        _fence: &super::Fence,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<super::Api>>, crate::SurfaceError> {
         let swapchain = self.swapchain.read();
         let sc = swapchain.as_ref().unwrap();

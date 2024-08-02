@@ -3,11 +3,7 @@ use super::conv;
 use ash::{amd, ext, khr, vk};
 use parking_lot::Mutex;
 
-use std::{
-    collections::BTreeMap,
-    ffi::CStr,
-    sync::{atomic::AtomicIsize, Arc},
-};
+use std::{collections::BTreeMap, ffi::CStr, sync::Arc};
 
 fn depth_stencil_required_flags() -> vk::FormatFeatureFlags {
     vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
@@ -110,6 +106,9 @@ pub struct PhysicalDeviceFeatures {
     zero_initialize_workgroup_memory:
         Option<vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures<'static>>,
 
+    /// Features provided by `VK_KHR_shader_atomic_int64`, promoted to Vulkan 1.2.
+    shader_atomic_int64: Option<vk::PhysicalDeviceShaderAtomicInt64Features<'static>>,
+
     /// Features provided by `VK_EXT_subgroup_size_control`, promoted to Vulkan 1.3.
     subgroup_size_control: Option<vk::PhysicalDeviceSubgroupSizeControlFeatures<'static>>,
 }
@@ -153,6 +152,9 @@ impl PhysicalDeviceFeatures {
             info = info.push_next(feature);
         }
         if let Some(ref mut feature) = self.ray_query {
+            info = info.push_next(feature);
+        }
+        if let Some(ref mut feature) = self.shader_atomic_int64 {
             info = info.push_next(feature);
         }
         if let Some(ref mut feature) = self.subgroup_size_control {
@@ -423,6 +425,21 @@ impl PhysicalDeviceFeatures {
             } else {
                 None
             },
+            shader_atomic_int64: if device_api_version >= vk::API_VERSION_1_2
+                || enabled_extensions.contains(&khr::shader_atomic_int64::NAME)
+            {
+                let needed = requested_features.intersects(
+                    wgt::Features::SHADER_INT64_ATOMIC_ALL_OPS
+                        | wgt::Features::SHADER_INT64_ATOMIC_MIN_MAX,
+                );
+                Some(
+                    vk::PhysicalDeviceShaderAtomicInt64Features::default()
+                        .shader_buffer_int64_atomics(needed)
+                        .shader_shared_int64_atomics(needed),
+                )
+            } else {
+                None
+            },
             subgroup_size_control: if device_api_version >= vk::API_VERSION_1_3
                 || enabled_extensions.contains(&ext::subgroup_size_control::NAME)
             {
@@ -562,6 +579,14 @@ impl PhysicalDeviceFeatures {
         features.set(F::SHADER_F64, self.core.shader_float64 != 0);
         features.set(F::SHADER_INT64, self.core.shader_int64 != 0);
         features.set(F::SHADER_I16, self.core.shader_int16 != 0);
+
+        if let Some(ref shader_atomic_int64) = self.shader_atomic_int64 {
+            features.set(
+                F::SHADER_INT64_ATOMIC_ALL_OPS | F::SHADER_INT64_ATOMIC_MIN_MAX,
+                shader_atomic_int64.shader_buffer_int64_atomics != 0
+                    && shader_atomic_int64.shader_shared_int64_atomics != 0,
+            );
+        }
 
         //if caps.supports_extension(khr::sampler_mirror_clamp_to_edge::NAME) {
         //if caps.supports_extension(ext::sampler_filter_minmax::NAME) {
@@ -712,7 +737,6 @@ impl PhysicalDeviceFeatures {
                 | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
         );
         features.set(F::RG11B10UFLOAT_RENDERABLE, rg11b10ufloat_renderable);
-        features.set(F::SHADER_UNUSED_VERTEX_OUTPUT, true);
 
         features.set(
             F::BGRA8UNORM_STORAGE,
@@ -968,6 +992,13 @@ impl PhysicalDeviceProperties {
             extensions.push(ext::texture_compression_astc_hdr::NAME);
         }
 
+        // Require `VK_KHR_shader_atomic_int64` if the associated feature was requested
+        if requested_features.intersects(
+            wgt::Features::SHADER_INT64_ATOMIC_ALL_OPS | wgt::Features::SHADER_INT64_ATOMIC_MIN_MAX,
+        ) {
+            extensions.push(khr::shader_atomic_int64::NAME);
+        }
+
         extensions
     }
 
@@ -1047,7 +1078,7 @@ impl PhysicalDeviceProperties {
             max_compute_workgroup_size_z: max_compute_workgroup_sizes[2],
             max_compute_workgroups_per_dimension,
             max_buffer_size,
-            max_non_sampler_bindings: std::u32::MAX,
+            max_non_sampler_bindings: u32::MAX,
         }
     }
 
@@ -1199,6 +1230,17 @@ impl super::InstanceShared {
                 let next = features
                     .timeline_semaphore
                     .insert(vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR::default());
+                features2 = features2.push_next(next);
+            }
+
+            // `VK_KHR_shader_atomic_int64` is promoted to 1.2, but has no
+            // changes, so we can keep using the extension unconditionally.
+            if capabilities.device_api_version >= vk::API_VERSION_1_2
+                || capabilities.supports_extension(khr::shader_atomic_int64::NAME)
+            {
+                let next = features
+                    .shader_atomic_int64
+                    .insert(vk::PhysicalDeviceShaderAtomicInt64Features::default());
                 features2 = features2.push_next(next);
             }
 
@@ -1554,6 +1596,7 @@ impl super::Adapter {
         handle_is_owned: bool,
         enabled_extensions: &[&'static CStr],
         features: wgt::Features,
+        memory_hints: &wgt::MemoryHints,
         family_index: u32,
         queue_index: u32,
     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
@@ -1685,6 +1728,13 @@ impl super::Adapter {
                 capabilities.push(spv::Capability::Int64);
             }
 
+            if features.intersects(
+                wgt::Features::SHADER_INT64_ATOMIC_ALL_OPS
+                    | wgt::Features::SHADER_INT64_ATOMIC_MIN_MAX,
+            ) {
+                capabilities.push(spv::Capability::Int64Atomics);
+            }
+
             let mut flags = spv::WriterFlags::empty();
             flags.set(
                 spv::WriterFlags::DEBUG,
@@ -1723,7 +1773,6 @@ impl super::Adapter {
                     } else {
                         naga::proc::BoundsCheckPolicy::Restrict
                     },
-                    image_store: naga::proc::BoundsCheckPolicy::Unchecked,
                     // TODO: support bounds checks on binding arrays
                     binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
                 },
@@ -1782,32 +1831,74 @@ impl super::Adapter {
             workarounds: self.workarounds,
             render_passes: Mutex::new(Default::default()),
             framebuffers: Mutex::new(Default::default()),
+            memory_allocations_counter: Default::default(),
         });
-        let mut relay_semaphores = [vk::Semaphore::null(); 2];
-        for sem in relay_semaphores.iter_mut() {
-            unsafe {
-                *sem = shared
-                    .raw
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
-            };
-        }
+
+        let relay_semaphores = super::RelaySemaphores::new(&shared)?;
+
         let queue = super::Queue {
             raw: raw_queue,
             swapchain_fn,
             device: Arc::clone(&shared),
             family_index,
-            relay_semaphores,
-            relay_index: AtomicIsize::new(-1),
+            relay_semaphores: Mutex::new(relay_semaphores),
         };
 
         let mem_allocator = {
             let limits = self.phd_capabilities.properties.limits;
-            let config = gpu_alloc::Config::i_am_prototyping(); //TODO
+
+            // Note: the parameters here are not set in stone nor where they picked with
+            // strong confidence.
+            // `final_free_list_chunk` should be bigger than starting_free_list_chunk if
+            // we want the behavior of starting with smaller block sizes and using larger
+            // ones only after we observe that the small ones aren't enough, which I think
+            // is a good "I don't know what the workload is going to be like" approach.
+            //
+            // For reference, `VMA`, and `gpu_allocator` both start with 256 MB blocks
+            // (then VMA doubles the block size each time it needs a new block).
+            // At some point it would be good to experiment with real workloads
+            //
+            // TODO(#5925): The plan is to switch the Vulkan backend from `gpu_alloc` to
+            // `gpu_allocator` which has a different (simpler) set of configuration options.
+            //
+            // TODO: These parameters should take hardware capabilities into account.
+            let mb = 1024 * 1024;
+            let perf_cfg = gpu_alloc::Config {
+                starting_free_list_chunk: 128 * mb,
+                final_free_list_chunk: 512 * mb,
+                minimal_buddy_size: 1,
+                initial_buddy_dedicated_size: 8 * mb,
+                dedicated_threshold: 32 * mb,
+                preferred_dedicated_threshold: mb,
+                transient_dedicated_threshold: 128 * mb,
+            };
+            let mem_usage_cfg = gpu_alloc::Config {
+                starting_free_list_chunk: 8 * mb,
+                final_free_list_chunk: 64 * mb,
+                minimal_buddy_size: 1,
+                initial_buddy_dedicated_size: 8 * mb,
+                dedicated_threshold: 8 * mb,
+                preferred_dedicated_threshold: mb,
+                transient_dedicated_threshold: 16 * mb,
+            };
+            let config = match memory_hints {
+                wgt::MemoryHints::Performance => perf_cfg,
+                wgt::MemoryHints::MemoryUsage => mem_usage_cfg,
+                wgt::MemoryHints::Manual {
+                    suballocated_device_memory_block_size,
+                } => gpu_alloc::Config {
+                    starting_free_list_chunk: suballocated_device_memory_block_size.start,
+                    final_free_list_chunk: suballocated_device_memory_block_size.end,
+                    initial_buddy_dedicated_size: suballocated_device_memory_block_size.start,
+                    ..perf_cfg
+                },
+            };
+
             let max_memory_allocation_size =
                 if let Some(maintenance_3) = self.phd_capabilities.maintenance_3 {
                     maintenance_3.max_memory_allocation_size
                 } else {
-                    u64::max_value()
+                    u64::MAX
                 };
             let properties = gpu_alloc::DeviceProperties {
                 max_memory_allocation_count: limits.max_memory_allocation_count,
@@ -1850,6 +1941,7 @@ impl super::Adapter {
             naga_options,
             #[cfg(feature = "renderdoc")]
             render_doc: Default::default(),
+            counters: Default::default(),
         };
 
         Ok(crate::OpenDevice { device, queue })
@@ -1863,6 +1955,7 @@ impl crate::Adapter for super::Adapter {
         &self,
         features: wgt::Features,
         _limits: &wgt::Limits,
+        memory_hints: &wgt::MemoryHints,
     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
         let enabled_extensions = self.required_device_extensions(features);
         let mut enabled_phd_features = self.physical_device_features(&enabled_extensions, features);
@@ -1896,6 +1989,7 @@ impl crate::Adapter for super::Adapter {
                 true,
                 &enabled_extensions,
                 features,
+                memory_hints,
                 family_info.queue_family_index,
                 0,
             )

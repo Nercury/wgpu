@@ -7,6 +7,7 @@ use js_sys::Promise;
 use std::{
     any::Any,
     cell::RefCell,
+    collections::HashMap,
     fmt,
     future::Future,
     marker::PhantomData,
@@ -1156,7 +1157,6 @@ impl crate::context::Context for ContextWebGpu {
     type SurfaceData = Sendable<(Canvas, webgpu_sys::GpuCanvasContext)>;
 
     type SurfaceOutputDetail = SurfaceOutputDetail;
-    type SubmissionIndex = Unused;
     type SubmissionIndexData = ();
     type PipelineCacheId = Unused;
     type PipelineCacheData = ();
@@ -2047,7 +2047,13 @@ impl crate::context::Context for ContextWebGpu {
         let module: &<ContextWebGpu as crate::Context>::ShaderModuleData =
             downcast_ref(desc.vertex.module.data.as_ref());
         let mut mapped_vertex_state = webgpu_sys::GpuVertexState::new(&module.0.module);
-        mapped_vertex_state.entry_point(desc.vertex.entry_point);
+        insert_constants_map(
+            &mapped_vertex_state,
+            desc.vertex.compilation_options.constants,
+        );
+        if let Some(ep) = desc.vertex.entry_point {
+            mapped_vertex_state.entry_point(ep);
+        }
 
         let buffers = desc
             .vertex
@@ -2123,7 +2129,10 @@ impl crate::context::Context for ContextWebGpu {
                 downcast_ref(frag.module.data.as_ref());
             let mut mapped_fragment_desc =
                 webgpu_sys::GpuFragmentState::new(&module.0.module, &targets);
-            mapped_fragment_desc.entry_point(frag.entry_point);
+            insert_constants_map(&mapped_vertex_state, frag.compilation_options.constants);
+            if let Some(ep) = frag.entry_point {
+                mapped_fragment_desc.entry_point(ep);
+            }
             mapped_desc.fragment(&mapped_fragment_desc);
         }
 
@@ -2149,7 +2158,10 @@ impl crate::context::Context for ContextWebGpu {
             downcast_ref(desc.module.data.as_ref());
         let mut mapped_compute_stage =
             webgpu_sys::GpuProgrammableStage::new(&shader_module.0.module);
-        mapped_compute_stage.entry_point(desc.entry_point);
+        insert_constants_map(&mapped_compute_stage, desc.compilation_options.constants);
+        if let Some(ep) = desc.entry_point {
+            mapped_compute_stage.entry_point(ep);
+        }
         let auto_layout = wasm_bindgen::JsValue::from(webgpu_sys::GpuAutoLayoutMode::Auto);
         let mut mapped_desc = webgpu_sys::GpuComputePipelineDescriptor::new(
             &match desc.layout {
@@ -2165,6 +2177,7 @@ impl crate::context::Context for ContextWebGpu {
         if let Some(label) = desc.label {
             mapped_desc.label(label);
         }
+
         create_identified(device_data.0.create_compute_pipeline(&mapped_desc))
     }
 
@@ -2730,21 +2743,11 @@ impl crate::context::Context for ContextWebGpu {
         )
     }
 
-    fn command_encoder_end_compute_pass(
-        &self,
-        _encoder: &Self::CommandEncoderId,
-        _encoder_data: &Self::CommandEncoderData,
-        _pass: &mut Self::ComputePassId,
-        pass_data: &mut Self::ComputePassData,
-    ) {
-        pass_data.0.end();
-    }
-
     fn command_encoder_begin_render_pass(
         &self,
         _encoder: &Self::CommandEncoderId,
         encoder_data: &Self::CommandEncoderData,
-        desc: &crate::RenderPassDescriptor<'_, '_>,
+        desc: &crate::RenderPassDescriptor<'_>,
     ) -> (Self::RenderPassId, Self::RenderPassData) {
         let mapped_color_attachments = desc
             .color_attachments
@@ -2836,16 +2839,6 @@ impl crate::context::Context for ContextWebGpu {
         }
 
         create_identified(encoder_data.0.begin_render_pass(&mapped_desc))
-    }
-
-    fn command_encoder_end_render_pass(
-        &self,
-        _encoder: &Self::CommandEncoderId,
-        _encoder_data: &Self::CommandEncoderData,
-        _pass: &mut Self::RenderPassId,
-        pass_data: &mut Self::RenderPassData,
-    ) {
-        pass_data.0.end();
     }
 
     fn command_encoder_finish(
@@ -3133,14 +3126,12 @@ impl crate::context::Context for ContextWebGpu {
         _queue: &Self::QueueId,
         queue_data: &Self::QueueData,
         command_buffers: I,
-    ) -> (Self::SubmissionIndex, Self::SubmissionIndexData) {
+    ) -> Self::SubmissionIndexData {
         let temp_command_buffers = command_buffers
             .map(|(_, data)| data.0)
             .collect::<js_sys::Array>();
 
         queue_data.0.submit(&temp_command_buffers);
-
-        (Unused, ())
     }
 
     fn queue_get_timestamp_period(
@@ -3163,6 +3154,22 @@ impl crate::context::Context for ContextWebGpu {
 
     fn device_start_capture(&self, _device: &Self::DeviceId, _device_data: &Self::DeviceData) {}
     fn device_stop_capture(&self, _device: &Self::DeviceId, _device_data: &Self::DeviceData) {}
+
+    fn device_get_internal_counters(
+        &self,
+        _device: &Self::DeviceId,
+        _device_data: &Self::DeviceData,
+    ) -> wgt::InternalCounters {
+        Default::default()
+    }
+
+    fn device_generate_allocator_report(
+        &self,
+        _device: &Self::DeviceId,
+        _device_data: &Self::DeviceData,
+    ) -> Option<wgt::AllocatorReport> {
+        None
+    }
 
     fn pipeline_cache_get_data(
         &self,
@@ -3300,6 +3307,14 @@ impl crate::context::Context for ContextWebGpu {
             &indirect_buffer_data.0.buffer,
             indirect_offset as f64,
         );
+    }
+
+    fn compute_pass_end(
+        &self,
+        _pass: &mut Self::ComputePassId,
+        pass_data: &mut Self::ComputePassData,
+    ) {
+        pass_data.0.end();
     }
 
     fn render_bundle_encoder_set_pipeline(
@@ -3881,6 +3896,14 @@ impl crate::context::Context for ContextWebGpu {
             .collect::<js_sys::Array>();
         pass_data.0.execute_bundles(&mapped);
     }
+
+    fn render_pass_end(
+        &self,
+        _pass: &mut Self::RenderPassId,
+        pass_data: &mut Self::RenderPassData,
+    ) {
+        pass_data.0.end();
+    }
 }
 
 pub(crate) type SurfaceOutputDetail = ();
@@ -3998,4 +4021,30 @@ impl Drop for BufferMappedRange {
                 .set(&js_sys::Uint8Array::view(temporary_mapping_slice), 0);
         }
     }
+}
+
+/// Adds the constants map to the given pipeline descriptor if the map is nonempty.
+/// Panics if the map cannot be set.
+///
+/// This function is necessary because the constants array is not currently
+/// exposed by `wasm-bindgen`. See the following issues for details:
+/// - [gfx-rs/wgpu#5688](https://github.com/gfx-rs/wgpu/pull/5688)
+/// - [rustwasm/wasm-bindgen#3587](https://github.com/rustwasm/wasm-bindgen/issues/3587)
+fn insert_constants_map(target: &JsValue, map: &HashMap<String, f64>) {
+    if !map.is_empty() {
+        js_sys::Reflect::set(target, &"constants".into(), &hashmap_to_jsvalue(map))
+            .expect("Setting the values in a Javascript pipeline descriptor should never fail");
+    }
+}
+
+/// Converts a hashmap to a Javascript object.
+fn hashmap_to_jsvalue(map: &HashMap<String, f64>) -> JsValue {
+    let obj = js_sys::Object::new();
+
+    for (k, v) in map.iter() {
+        js_sys::Reflect::set(&obj, &k.into(), &(*v).into())
+            .expect("Setting the values in a Javascript map should never fail");
+    }
+
+    JsValue::from(obj)
 }
