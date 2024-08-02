@@ -302,16 +302,14 @@ impl ContextWgpuCore {
     fn try_handle_error(
         &self,
         sink_mutex: &Mutex<ErrorSinkRaw>,
-        cause: impl Error + WasmNotSendSync + 'static,
-        label_key: &'static str,
+        source: impl Error + WasmNotSendSync + 'static,
         label: Label<'_>,
-        string: &'static str,
+        fn_ident: &'static str,
     ) -> Option<String> {
         let error = wgc::error::ContextError {
-            string,
-            cause: Box::new(cause),
+            fn_ident,
+            source: Box::new(source),
             label: label.unwrap_or_default().to_string(),
-            label_key,
         };
         let mut sink = sink_mutex.lock();
         let mut source_opt: Option<&(dyn Error + 'static)> = Some(&error);
@@ -1033,7 +1031,6 @@ impl crate::Context for ContextWgpuCore {
                 return Err(self.try_handle_error(
                     &device_data.error_sink,
                     cause,
-                    LABEL,
                     desc.label,
                     "Device::create_shader_module",
                 ).expect("failed to retrieve error string"));
