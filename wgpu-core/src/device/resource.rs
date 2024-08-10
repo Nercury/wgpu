@@ -55,8 +55,8 @@ use std::{
 };
 
 use super::{
-    queue::{self, Queue},
-    DeviceDescriptor, DeviceError, UserClosures, ENTRYPOINT_FAILURE_ERROR, ZERO_BUFFER_SIZE,
+    queue::Queue, DeviceDescriptor, DeviceError, UserClosures, ENTRYPOINT_FAILURE_ERROR,
+    ZERO_BUFFER_SIZE,
 };
 
 /// Structure describing a logical device. Some members are internally mutable,
@@ -407,7 +407,7 @@ impl<A: HalApi> Device<A> {
     pub(crate) fn maintain<'this>(
         &'this self,
         fence_guard: crate::lock::RwLockReadGuard<Option<A::Fence>>,
-        maintain: wgt::Maintain<queue::WrappedSubmissionIndex>,
+        maintain: wgt::Maintain<crate::SubmissionIndex>,
         snatch_guard: SnatchGuard,
     ) -> Result<(UserClosures, bool), WaitIdleError> {
         profiling::scope!("Device::maintain");
@@ -417,9 +417,20 @@ impl<A: HalApi> Device<A> {
         // Determine which submission index `maintain` represents.
         let submission_index = match maintain {
             wgt::Maintain::WaitForSubmissionIndex(submission_index) => {
-                // We don't need to check to see if the queue id matches
-                // as we already checked this from inside the poll call.
-                submission_index.index
+                let last_successful_submission_index = self
+                    .last_successful_submission_index
+                    .load(Ordering::Acquire);
+
+                if let wgt::Maintain::WaitForSubmissionIndex(submission_index) = maintain {
+                    if submission_index > last_successful_submission_index {
+                        return Err(WaitIdleError::WrongSubmissionIndex(
+                            submission_index,
+                            last_successful_submission_index,
+                        ));
+                    }
+                }
+
+                submission_index
             }
             wgt::Maintain::Wait => self
                 .last_successful_submission_index
@@ -734,8 +745,12 @@ impl<A: HalApi> Device<A> {
                     desc.dimension,
                 ));
             }
+        }
 
-            // Compressed textures can only be 2D
+        if desc.dimension != wgt::TextureDimension::D2
+            && desc.dimension != wgt::TextureDimension::D3
+        {
+            // Compressed textures can only be 2D or 3D
             if desc.format.is_compressed() {
                 return Err(CreateTextureError::InvalidCompressedDimension(
                     desc.dimension,
@@ -765,6 +780,19 @@ impl<A: HalApi> Device<A> {
                         format: desc.format,
                     },
                 ));
+            }
+
+            if desc.dimension == wgt::TextureDimension::D3 {
+                // Only BCn formats with Sliced 3D feature can be used for 3D textures
+                if desc.format.is_bcn() {
+                    self.require_features(wgt::Features::TEXTURE_COMPRESSION_BC_SLICED_3D)
+                        .map_err(|error| CreateTextureError::MissingFeatures(desc.format, error))?;
+                } else {
+                    return Err(CreateTextureError::InvalidCompressedDimension(
+                        desc.dimension,
+                        desc.format,
+                    ));
+                }
             }
         }
 
@@ -1418,7 +1446,7 @@ impl<A: HalApi> Device<A> {
         self: &Arc<Self>,
         desc: &pipeline::ShaderModuleDescriptor<'a>,
         source: pipeline::ShaderModuleSource<'a>,
-    ) -> Result<pipeline::ShaderModule<A>, pipeline::CreateShaderModuleError> {
+    ) -> Result<Arc<pipeline::ShaderModule<A>>, pipeline::CreateShaderModuleError> {
         self.check_is_valid()?;
 
         let (module, source) = match source {
@@ -1535,12 +1563,16 @@ impl<A: HalApi> Device<A> {
             }
         };
 
-        Ok(pipeline::ShaderModule {
+        let module = pipeline::ShaderModule {
             raw: Some(raw),
             device: self.clone(),
             interface: Some(interface),
             label: desc.label.to_string(),
-        })
+        };
+
+        let module = Arc::new(module);
+
+        Ok(module)
     }
 
     #[allow(unused_unsafe)]
@@ -1548,7 +1580,7 @@ impl<A: HalApi> Device<A> {
         self: &Arc<Self>,
         desc: &pipeline::ShaderModuleDescriptor<'a>,
         source: &'a [u32],
-    ) -> Result<pipeline::ShaderModule<A>, pipeline::CreateShaderModuleError> {
+    ) -> Result<Arc<pipeline::ShaderModule<A>>, pipeline::CreateShaderModuleError> {
         self.check_is_valid()?;
 
         self.require_features(wgt::Features::SPIRV_SHADER_PASSTHROUGH)?;
@@ -1577,18 +1609,22 @@ impl<A: HalApi> Device<A> {
             }
         };
 
-        Ok(pipeline::ShaderModule {
+        let module = pipeline::ShaderModule {
             raw: Some(raw),
             device: self.clone(),
             interface: None,
             label: desc.label.to_string(),
-        })
+        };
+
+        let module = Arc::new(module);
+
+        Ok(module)
     }
 
     pub(crate) fn create_command_encoder(
         self: &Arc<Self>,
         label: &crate::Label,
-    ) -> Result<command::CommandBuffer<A>, DeviceError> {
+    ) -> Result<Arc<command::CommandBuffer<A>>, DeviceError> {
         self.check_is_valid()?;
 
         let queue = self.get_queue().unwrap();
@@ -1597,13 +1633,11 @@ impl<A: HalApi> Device<A> {
             .command_allocator
             .acquire_encoder(self.raw(), queue.raw())?;
 
-        Ok(command::CommandBuffer::new(
-            encoder,
-            self,
-            #[cfg(feature = "trace")]
-            self.trace.lock().is_some(),
-            label,
-        ))
+        let command_buffer = command::CommandBuffer::new(encoder, self, label);
+
+        let command_buffer = Arc::new(command_buffer);
+
+        Ok(command_buffer)
     }
 
     /// Generate information about late-validated buffer bindings for pipelines.
@@ -1648,7 +1682,7 @@ impl<A: HalApi> Device<A> {
         label: &crate::Label,
         entry_map: bgl::EntryMap,
         origin: bgl::Origin,
-    ) -> Result<BindGroupLayout<A>, binding_model::CreateBindGroupLayoutError> {
+    ) -> Result<Arc<BindGroupLayout<A>>, binding_model::CreateBindGroupLayoutError> {
         #[derive(PartialEq)]
         enum WritableStorage {
             Yes,
@@ -1847,7 +1881,7 @@ impl<A: HalApi> Device<A> {
             .validate(&self.limits)
             .map_err(binding_model::CreateBindGroupLayoutError::TooManyBindings)?;
 
-        Ok(BindGroupLayout {
+        let bgl = BindGroupLayout {
             raw: Some(raw),
             device: self.clone(),
             entries: entry_map,
@@ -1855,8 +1889,11 @@ impl<A: HalApi> Device<A> {
             exclusive_pipeline: OnceCell::new(),
             binding_count_validator: count_validator,
             label: label.to_string(),
-            tracking_data: TrackingData::new(self.tracker_indices.bind_group_layouts.clone()),
-        })
+        };
+
+        let bgl = Arc::new(bgl);
+
+        Ok(bgl)
     }
 
     pub(crate) fn create_buffer_binding<'a>(
@@ -1917,7 +1954,7 @@ impl<A: HalApi> Device<A> {
 
         let buffer = &bb.buffer;
 
-        used.buffers.add_single(buffer, internal_use);
+        used.buffers.insert_single(buffer.clone(), internal_use);
 
         buffer.same_device(self)?;
 
@@ -1998,14 +2035,14 @@ impl<A: HalApi> Device<A> {
 
     fn create_sampler_binding<'a>(
         self: &Arc<Self>,
-        used: &BindGroupStates<A>,
+        used: &mut BindGroupStates<A>,
         binding: u32,
         decl: &wgt::BindGroupLayoutEntry,
         sampler: &'a Arc<Sampler<A>>,
     ) -> Result<&'a A::Sampler, binding_model::CreateBindGroupError> {
         use crate::binding_model::CreateBindGroupError as Error;
 
-        used.samplers.add_single(sampler);
+        used.samplers.insert_single(sampler.clone());
 
         sampler.same_device(self)?;
 
@@ -2054,8 +2091,6 @@ impl<A: HalApi> Device<A> {
         used_texture_ranges: &mut Vec<TextureInitTrackerAction<A>>,
         snatch_guard: &'a SnatchGuard<'a>,
     ) -> Result<hal::TextureBinding<'a, A>, binding_model::CreateBindGroupError> {
-        used.views.add_single(view);
-
         view.same_device(self)?;
 
         let (pub_usage, internal_use) = self.texture_use_parameters(
@@ -2064,12 +2099,10 @@ impl<A: HalApi> Device<A> {
             view,
             "SampledTexture, ReadonlyStorageTexture or WriteonlyStorageTexture",
         )?;
-        let texture = &view.parent;
-        // Careful here: the texture may no longer have its own ref count,
-        // if it was deleted by the user.
-        used.textures
-            .add_single(texture, Some(view.selector.clone()), internal_use);
 
+        used.views.insert_single(view.clone(), internal_use);
+
+        let texture = &view.parent;
         texture.check_usage(pub_usage)?;
 
         used_texture_ranges.push(TextureInitTrackerAction {
@@ -2177,7 +2210,7 @@ impl<A: HalApi> Device<A> {
                     (res_index, num_bindings)
                 }
                 Br::Sampler(ref sampler) => {
-                    let sampler = self.create_sampler_binding(&used, binding, decl, sampler)?;
+                    let sampler = self.create_sampler_binding(&mut used, binding, decl, sampler)?;
 
                     let res_index = hal_samplers.len();
                     hal_samplers.push(sampler);
@@ -2189,7 +2222,8 @@ impl<A: HalApi> Device<A> {
 
                     let res_index = hal_samplers.len();
                     for sampler in samplers.iter() {
-                        let sampler = self.create_sampler_binding(&used, binding, decl, sampler)?;
+                        let sampler =
+                            self.create_sampler_binding(&mut used, binding, decl, sampler)?;
 
                         hal_samplers.push(sampler);
                     }
@@ -2473,7 +2507,8 @@ impl<A: HalApi> Device<A> {
     pub(crate) fn create_pipeline_layout(
         self: &Arc<Self>,
         desc: &binding_model::ResolvedPipelineLayoutDescriptor<A>,
-    ) -> Result<binding_model::PipelineLayout<A>, binding_model::CreatePipelineLayoutError> {
+    ) -> Result<Arc<binding_model::PipelineLayout<A>>, binding_model::CreatePipelineLayoutError>
+    {
         use crate::binding_model::CreatePipelineLayoutError as Error;
 
         self.check_is_valid()?;
@@ -2565,14 +2600,17 @@ impl<A: HalApi> Device<A> {
 
         drop(raw_bind_group_layouts);
 
-        Ok(binding_model::PipelineLayout {
+        let layout = binding_model::PipelineLayout {
             raw: Some(raw),
             device: self.clone(),
             label: desc.label.to_string(),
-            tracking_data: TrackingData::new(self.tracker_indices.pipeline_layouts.clone()),
             bind_group_layouts,
             push_constant_ranges: desc.push_constant_ranges.iter().cloned().collect(),
-        })
+        };
+
+        let layout = Arc::new(layout);
+
+        Ok(layout)
     }
 
     pub(crate) fn derive_pipeline_layout(
@@ -2601,7 +2639,6 @@ impl<A: HalApi> Device<A> {
                             bgl::Origin::Derived,
                         ) {
                             Ok(bgl) => {
-                                let bgl = Arc::new(bgl);
                                 e.insert(bgl.clone());
                                 Ok(bgl)
                             }
@@ -2619,7 +2656,6 @@ impl<A: HalApi> Device<A> {
         };
 
         let layout = self.create_pipeline_layout(&layout_desc)?;
-        let layout = Arc::new(layout);
         Ok(layout)
     }
 
@@ -3384,7 +3420,7 @@ impl<A: HalApi> Device<A> {
     pub unsafe fn create_pipeline_cache(
         self: &Arc<Self>,
         desc: &pipeline::PipelineCacheDescriptor,
-    ) -> Result<pipeline::PipelineCache<A>, pipeline::CreatePipelineCacheError> {
+    ) -> Result<Arc<pipeline::PipelineCache<A>>, pipeline::CreatePipelineCacheError> {
         use crate::pipeline_cache;
 
         self.check_is_valid()?;
@@ -3420,10 +3456,12 @@ impl<A: HalApi> Device<A> {
         let cache = pipeline::PipelineCache {
             device: self.clone(),
             label: desc.label.to_string(),
-            tracking_data: TrackingData::new(self.tracker_indices.pipeline_caches.clone()),
             // This would be none in the error condition, which we don't implement yet
             raw: Some(raw),
         };
+
+        let cache = Arc::new(cache);
+
         Ok(cache)
     }
 

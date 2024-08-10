@@ -339,12 +339,7 @@ impl<A: HalApi> Drop for CommandBuffer<A> {
 }
 
 impl<A: HalApi> CommandBuffer<A> {
-    pub(crate) fn new(
-        encoder: A::CommandEncoder,
-        device: &Arc<Device<A>>,
-        #[cfg(feature = "trace")] enable_tracing: bool,
-        label: &Label,
-    ) -> Self {
+    pub(crate) fn new(encoder: A::CommandEncoder, device: &Arc<Device<A>>, label: &Label) -> Self {
         CommandBuffer {
             device: device.clone(),
             support_clear_texture: device.features.contains(wgt::Features::CLEAR_TEXTURE),
@@ -364,7 +359,7 @@ impl<A: HalApi> CommandBuffer<A> {
                     texture_memory_actions: Default::default(),
                     pending_query_resets: QueryResetMap::new(),
                     #[cfg(feature = "trace")]
-                    commands: if enable_tracing {
+                    commands: if device.trace.lock().is_some() {
                         Some(Vec::new())
                     } else {
                         None
@@ -595,6 +590,8 @@ pub enum CommandEncoderError {
     InvalidTimestampWritesQuerySetId(id::QuerySetId),
     #[error("Attachment TextureViewId {0:?} is invalid")]
     InvalidAttachmentId(id::TextureViewId),
+    #[error(transparent)]
+    InvalidColorAttachment(#[from] ColorAttachmentError),
     #[error("Resolve attachment TextureViewId {0:?} is invalid")]
     InvalidResolveTargetId(id::TextureViewId),
     #[error("Depth stencil attachment TextureViewId {0:?} is invalid")]
