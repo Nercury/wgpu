@@ -63,10 +63,20 @@ macro_rules! define_lock_ranks {
         }
 
         impl LockRankSet {
-            pub fn name(self) -> &'static str {
+            pub fn member_name(self) -> &'static str {
                 match self {
                     $(
                         LockRankSet:: $name => $member,
+                    )*
+                    _ => "<unrecognized LockRankSet bit>",
+                }
+            }
+
+            #[cfg_attr(not(feature = "observe_locks"), allow(dead_code))]
+            pub fn const_name(self) -> &'static str {
+                match self {
+                    $(
+                        LockRankSet:: $name => stringify!($name),
                     )*
                     _ => "<unrecognized LockRankSet bit>",
                 }
@@ -120,7 +130,6 @@ define_lock_ranks! {
 
     rank BUFFER_BIND_GROUPS "Buffer::bind_groups" followed by { }
     rank BUFFER_INITIALIZATION_STATUS "Buffer::initialization_status" followed by { }
-    rank BUFFER_SYNC_MAPPED_WRITES "Buffer::sync_mapped_writes" followed by { }
     rank DEVICE_DEFERRED_DESTROY "Device::deferred_destroy" followed by { }
     rank DEVICE_FENCE "Device::fence" followed by { }
     #[allow(dead_code)]
@@ -134,7 +143,6 @@ define_lock_ranks! {
     rank SURFACE_PRESENTATION "Surface::presentation" followed by { }
     rank TEXTURE_BIND_GROUPS "Texture::bind_groups" followed by { }
     rank TEXTURE_INITIALIZATION_STATUS "Texture::initialization_status" followed by { }
-    rank TEXTURE_CLEAR_MODE "Texture::clear_mode" followed by { }
     rank TEXTURE_VIEWS "Texture::views" followed by { }
 
     #[cfg(test)]

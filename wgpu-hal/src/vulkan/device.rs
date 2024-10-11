@@ -1,4 +1,4 @@
-use super::{conv, PipelineCache};
+use super::conv;
 
 use arrayvec::ArrayVec;
 use ash::{khr, vk};
@@ -15,6 +15,13 @@ use std::{
 };
 
 impl super::DeviceShared {
+    /// Set the name of `object` to `name`.
+    ///
+    /// If `name` contains an interior null byte, then the name set will be truncated to that byte.
+    ///
+    /// # Safety
+    ///
+    /// It must be valid to set `object`'s debug name
     pub(super) unsafe fn set_object_name(&self, object: impl vk::Handle, name: &str) {
         let Some(extension) = self.extension_fns.debug_utils.as_ref() else {
             return;
@@ -44,7 +51,7 @@ impl super::DeviceShared {
             &buffer_vec
         };
 
-        let name = unsafe { CStr::from_bytes_with_nul_unchecked(name_bytes) };
+        let name = CStr::from_bytes_until_nul(name_bytes).expect("We have added a null byte");
 
         let _result = unsafe {
             extension.set_debug_utils_object_name(
@@ -178,7 +185,11 @@ impl super::DeviceShared {
                     vk_info = vk_info.push_next(&mut multiview_info);
                 }
 
-                let raw = unsafe { self.raw.create_render_pass(&vk_info, None)? };
+                let raw = unsafe {
+                    self.raw
+                        .create_render_pass(&vk_info, None)
+                        .map_err(super::map_host_device_oom_err)?
+                };
 
                 *e.insert(raw)
             }
@@ -286,7 +297,7 @@ impl super::DeviceShared {
         for &raw in self.framebuffers.lock().values() {
             unsafe { self.raw.destroy_framebuffer(raw, None) };
         }
-        if self.handle_is_owned {
+        if self.drop_guard.is_none() {
             unsafe { self.raw.destroy_device(None) };
         }
     }
@@ -322,8 +333,11 @@ impl gpu_alloc::MemoryDevice<vk::DeviceMemory> for super::DeviceShared {
             Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY) => {
                 Err(gpu_alloc::OutOfMemory::OutOfHostMemory)
             }
-            Err(vk::Result::ERROR_TOO_MANY_OBJECTS) => panic!("Too many objects"),
-            Err(err) => panic!("Unexpected Vulkan error: `{err}`"),
+            // We don't use VK_KHR_external_memory
+            // VK_ERROR_INVALID_EXTERNAL_HANDLE
+            // We don't use VK_KHR_buffer_device_address
+            // VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS_KHR
+            Err(err) => handle_unexpected(err),
         }
     }
 
@@ -352,7 +366,7 @@ impl gpu_alloc::MemoryDevice<vk::DeviceMemory> for super::DeviceShared {
                 Err(gpu_alloc::DeviceMapError::OutOfHostMemory)
             }
             Err(vk::Result::ERROR_MEMORY_MAP_FAILED) => Err(gpu_alloc::DeviceMapError::MapFailed),
-            Err(err) => panic!("Unexpected Vulkan error: `{err}`"),
+            Err(err) => handle_unexpected(err),
         }
     }
 
@@ -451,10 +465,7 @@ impl
             Err(vk::Result::ERROR_FRAGMENTATION) => {
                 Err(gpu_descriptor::CreatePoolError::Fragmentation)
             }
-            Err(other) => {
-                log::error!("create_descriptor_pool: {:?}", other);
-                Err(gpu_descriptor::CreatePoolError::OutOfHostMemory)
-            }
+            Err(err) => handle_unexpected(err),
         }
     }
 
@@ -495,10 +506,7 @@ impl
             Err(vk::Result::ERROR_FRAGMENTED_POOL) => {
                 Err(gpu_descriptor::DeviceAllocationError::FragmentedPool)
             }
-            Err(other) => {
-                log::error!("allocate_descriptor_sets: {:?}", other);
-                Err(gpu_descriptor::DeviceAllocationError::OutOfHostMemory)
-            }
+            Err(err) => handle_unexpected(err),
         }
     }
 
@@ -515,7 +523,7 @@ impl
         };
         match result {
             Ok(()) => {}
-            Err(err) => log::error!("free_descriptor_sets: {:?}", err),
+            Err(err) => handle_unexpected(err),
         }
     }
 }
@@ -605,17 +613,20 @@ impl super::Device {
             Ok(swapchain) => swapchain,
             Err(error) => {
                 return Err(match error {
-                    vk::Result::ERROR_SURFACE_LOST_KHR => crate::SurfaceError::Lost,
+                    vk::Result::ERROR_SURFACE_LOST_KHR
+                    | vk::Result::ERROR_INITIALIZATION_FAILED => crate::SurfaceError::Lost,
                     vk::Result::ERROR_NATIVE_WINDOW_IN_USE_KHR => {
                         crate::SurfaceError::Other("Native window is in use")
                     }
-                    other => crate::DeviceError::from(other).into(),
-                })
+                    // We don't use VK_EXT_image_compression_control
+                    // VK_ERROR_COMPRESSION_EXHAUSTED_EXT
+                    other => super::map_host_device_oom_and_lost_err(other).into(),
+                });
             }
         };
 
         let images =
-            unsafe { functor.get_swapchain_images(raw) }.map_err(crate::DeviceError::from)?;
+            unsafe { functor.get_swapchain_images(raw) }.map_err(super::map_host_device_oom_err)?;
 
         // NOTE: It's important that we define at least images.len() wait
         // semaphores, since we prospectively need to provide the call to
@@ -638,19 +649,20 @@ impl super::Device {
             view_formats: wgt_view_formats,
             surface_semaphores,
             next_semaphore_index: 0,
+            next_present_time: None,
         })
     }
 
     /// # Safety
     ///
     /// - `vk_image` must be created respecting `desc`
-    /// - If `drop_guard` is `Some`, the application must manually destroy the image handle. This
-    ///   can be done inside the `Drop` impl of `drop_guard`.
+    /// - If `drop_callback` is [`None`], wgpu-hal will take ownership of `vk_image`. If
+    ///   `drop_callback` is [`Some`], `vk_image` must be valid until the callback is called.
     /// - If the `ImageCreateFlags` does not contain `MUTABLE_FORMAT`, the `view_formats` of `desc` must be empty.
     pub unsafe fn texture_from_raw(
         vk_image: vk::Image,
         desc: &crate::TextureDescriptor,
-        drop_guard: Option<crate::DropGuard>,
+        drop_callback: Option<crate::DropCallback>,
     ) -> super::Texture {
         let mut raw_flags = vk::ImageCreateFlags::empty();
         let mut view_formats = vec![];
@@ -668,6 +680,8 @@ impl super::Device {
         if desc.format.is_multi_planar_format() {
             raw_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
         }
+
+        let drop_guard = crate::DropGuard::from_option(drop_callback);
 
         super::Texture {
             raw: vk_image,
@@ -702,14 +716,22 @@ impl super::Device {
 
         let raw = unsafe {
             profiling::scope!("vkCreateShaderModule");
-            self.shared.raw.create_shader_module(&vk_info, None)?
+            self.shared
+                .raw
+                .create_shader_module(&vk_info, None)
+                .map_err(map_err)?
         };
+        fn map_err(err: vk::Result) -> crate::DeviceError {
+            // We don't use VK_NV_glsl_shader
+            // VK_ERROR_INVALID_SHADER_NV
+            super::map_host_device_oom_err(err)
+        }
         Ok(raw)
     }
 
     fn compile_stage(
         &self,
-        stage: &crate::ProgrammableStage<super::Api>,
+        stage: &crate::ProgrammableStage<super::ShaderModule>,
         naga_stage: naga::ShaderStage,
         binding_map: &naga::back::spv::BindingMap,
     ) -> Result<CompiledStage, crate::PipelineError> {
@@ -747,6 +769,7 @@ impl super::Device {
                         temp_options.debug_info = Some(naga::back::spv::DebugInfo {
                             source_code: &debug.source_code,
                             file_name: debug.file_name.as_ref().as_ref(),
+                            language: naga::back::spv::SourceLanguage::WGSL,
                         })
                     }
                     if !stage.zero_initialize_workgroup_memory {
@@ -764,7 +787,9 @@ impl super::Device {
                     &naga_shader.info,
                     stage.constants,
                 )
-                .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
+                .map_err(|e| {
+                    crate::PipelineError::PipelineConstants(stage_flags, format!("{e}"))
+                })?;
 
                 let spv = {
                     profiling::scope!("naga::spv::write_vec");
@@ -857,7 +882,12 @@ impl crate::Device for super::Device {
             .usage(conv::map_buffer_usage(desc.usage))
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let raw = unsafe { self.shared.raw.create_buffer(&vk_info, None)? };
+        let raw = unsafe {
+            self.shared
+                .raw
+                .create_buffer(&vk_info, None)
+                .map_err(super::map_host_device_oom_and_ioca_err)?
+        };
         let req = unsafe { self.shared.raw.get_buffer_memory_requirements(raw) };
 
         let mut alloc_usage = if desc
@@ -907,7 +937,8 @@ impl crate::Device for super::Device {
         unsafe {
             self.shared
                 .raw
-                .bind_buffer_memory(raw, *block.memory(), block.offset())?
+                .bind_buffer_memory(raw, *block.memory(), block.offset())
+                .map_err(super::map_host_device_oom_and_ioca_err)?
         };
 
         if let Some(label) = desc.label {
@@ -933,6 +964,10 @@ impl crate::Device for super::Device {
         self.counters.buffers.sub(1);
     }
 
+    unsafe fn add_raw_buffer(&self, _buffer: &super::Buffer) {
+        self.counters.buffers.add(1);
+    }
+
     unsafe fn map_buffer(
         &self,
         buffer: &super::Buffer,
@@ -947,13 +982,14 @@ impl crate::Device for super::Device {
                 .contains(gpu_alloc::MemoryPropertyFlags::HOST_COHERENT);
             Ok(crate::BufferMapping { ptr, is_coherent })
         } else {
-            Err(crate::DeviceError::OutOfMemory)
+            crate::hal_usage_error("tried to map external buffer")
         }
     }
     unsafe fn unmap_buffer(&self, buffer: &super::Buffer) {
-        // We can only unmap the buffer if it was already mapped successfully.
         if let Some(ref block) = buffer.block {
             unsafe { block.lock().unmap(&*self.shared) };
+        } else {
+            crate::hal_usage_error("tried to unmap external buffer")
         }
     }
 
@@ -1039,7 +1075,17 @@ impl crate::Device for super::Device {
             vk_info = vk_info.push_next(&mut format_list_info);
         }
 
-        let raw = unsafe { self.shared.raw.create_image(&vk_info, None)? };
+        let raw = unsafe {
+            self.shared
+                .raw
+                .create_image(&vk_info, None)
+                .map_err(map_err)?
+        };
+        fn map_err(err: vk::Result) -> crate::DeviceError {
+            // We don't use VK_EXT_image_compression_control
+            // VK_ERROR_COMPRESSION_EXHAUSTED_EXT
+            super::map_host_device_oom_and_ioca_err(err)
+        }
         let req = unsafe { self.shared.raw.get_image_memory_requirements(raw) };
 
         let block = unsafe {
@@ -1059,7 +1105,8 @@ impl crate::Device for super::Device {
         unsafe {
             self.shared
                 .raw
-                .bind_image_memory(raw, *block.memory(), block.offset())?
+                .bind_image_memory(raw, *block.memory(), block.offset())
+                .map_err(super::map_host_device_oom_err)?
         };
 
         if let Some(label) = desc.label {
@@ -1092,6 +1139,10 @@ impl crate::Device for super::Device {
         self.counters.textures.sub(1);
     }
 
+    unsafe fn add_raw_texture(&self, _texture: &super::Texture) {
+        self.counters.textures.add(1);
+    }
+
     unsafe fn create_texture_view(
         &self,
         texture: &super::Texture,
@@ -1117,7 +1168,8 @@ impl crate::Device for super::Device {
             texture.usage
         };
 
-        let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }?;
+        let raw = unsafe { self.shared.raw.create_image_view(&vk_info, None) }
+            .map_err(super::map_host_device_oom_and_ioca_err)?;
 
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -1195,7 +1247,12 @@ impl crate::Device for super::Device {
             vk_info = vk_info.border_color(conv::map_border_color(color));
         }
 
-        let raw = unsafe { self.shared.raw.create_sampler(&vk_info, None)? };
+        let raw = unsafe {
+            self.shared
+                .raw
+                .create_sampler(&vk_info, None)
+                .map_err(super::map_host_device_oom_and_ioca_err)?
+        };
 
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -1213,12 +1270,18 @@ impl crate::Device for super::Device {
 
     unsafe fn create_command_encoder(
         &self,
-        desc: &crate::CommandEncoderDescriptor<super::Api>,
+        desc: &crate::CommandEncoderDescriptor<super::Queue>,
     ) -> Result<super::CommandEncoder, crate::DeviceError> {
         let vk_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(desc.queue.family_index)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-        let raw = unsafe { self.shared.raw.create_command_pool(&vk_info, None)? };
+
+        let raw = unsafe {
+            self.shared
+                .raw
+                .create_command_pool(&vk_info, None)
+                .map_err(super::map_host_device_oom_err)?
+        };
 
         self.counters.command_encoders.add(1);
 
@@ -1357,7 +1420,8 @@ impl crate::Device for super::Device {
         let raw = unsafe {
             self.shared
                 .raw
-                .create_descriptor_set_layout(&vk_info, None)?
+                .create_descriptor_set_layout(&vk_info, None)
+                .map_err(super::map_host_device_oom_err)?
         };
 
         if let Some(label) = desc.label {
@@ -1385,7 +1449,7 @@ impl crate::Device for super::Device {
 
     unsafe fn create_pipeline_layout(
         &self,
-        desc: &crate::PipelineLayoutDescriptor<super::Api>,
+        desc: &crate::PipelineLayoutDescriptor<super::BindGroupLayout>,
     ) -> Result<super::PipelineLayout, crate::DeviceError> {
         //Note: not bothering with on stack array here as it's low frequency
         let vk_set_layouts = desc
@@ -1410,7 +1474,12 @@ impl crate::Device for super::Device {
 
         let raw = {
             profiling::scope!("vkCreatePipelineLayout");
-            unsafe { self.shared.raw.create_pipeline_layout(&vk_info, None)? }
+            unsafe {
+                self.shared
+                    .raw
+                    .create_pipeline_layout(&vk_info, None)
+                    .map_err(super::map_host_device_oom_err)?
+            }
         };
 
         if let Some(label) = desc.label {
@@ -1451,7 +1520,13 @@ impl crate::Device for super::Device {
 
     unsafe fn create_bind_group(
         &self,
-        desc: &crate::BindGroupDescriptor<super::Api>,
+        desc: &crate::BindGroupDescriptor<
+            super::BindGroupLayout,
+            super::Buffer,
+            super::Sampler,
+            super::TextureView,
+            super::AccelerationStructure,
+        >,
     ) -> Result<super::BindGroup, crate::DeviceError> {
         let mut vk_sets = unsafe {
             self.desc_allocator.lock().allocate(
@@ -1504,16 +1579,13 @@ impl crate::Device for super::Device {
                 // we can't use the safe (yet unstable) MaybeUninit::write_slice() here because of having an iterator to write
 
                 let init = {
-                    #[allow(trivial_casts)]
                     // SAFETY: The loop above has initialized exactly as many items as to_init is
                     // long, so it is safe to cast away the MaybeUninit<T> wrapper into T.
 
                     // Additional safety docs from unstable slice_assume_init_mut
                     // SAFETY: similar to safety notes for `slice_get_ref`, but we have a
                     // mutable reference which is also guaranteed to be valid for writes.
-                    unsafe {
-                        &mut *(ptr::from_mut::<[MaybeUninit<T>]>(to_init) as *mut [T])
-                    }
+                    unsafe { std::mem::transmute::<&mut [MaybeUninit<T>], &mut [T]>(to_init) }
                 };
                 (Self { remainder }, init)
             }
@@ -1671,6 +1743,7 @@ impl crate::Device for super::Device {
                         .map(|d| naga::back::spv::DebugInfo {
                             source_code: d.source_code.as_ref(),
                             file_name: d.file_name.as_ref().as_ref(),
+                            language: naga::back::spv::SourceLanguage::WGSL,
                         });
                 if !desc.runtime_checks {
                     naga_options.bounds_check_policies = naga::proc::BoundsCheckPolicies {
@@ -1717,7 +1790,11 @@ impl crate::Device for super::Device {
 
     unsafe fn create_render_pipeline(
         &self,
-        desc: &crate::RenderPipelineDescriptor<super::Api>,
+        desc: &crate::RenderPipelineDescriptor<
+            super::PipelineLayout,
+            super::ShaderModule,
+            super::PipelineCache,
+        >,
     ) -> Result<super::RenderPipeline, crate::PipelineError> {
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
@@ -1923,7 +2000,7 @@ impl crate::Device for super::Device {
                 self.shared
                     .raw
                     .create_graphics_pipelines(pipeline_cache, &vk_infos, None)
-                    .map_err(|(_, e)| crate::DeviceError::from(e))
+                    .map_err(|(_, e)| super::map_pipeline_err(e))
             }?
         };
 
@@ -1947,6 +2024,7 @@ impl crate::Device for super::Device {
 
         Ok(super::RenderPipeline { raw })
     }
+
     unsafe fn destroy_render_pipeline(&self, pipeline: super::RenderPipeline) {
         unsafe { self.shared.raw.destroy_pipeline(pipeline.raw, None) };
 
@@ -1955,7 +2033,11 @@ impl crate::Device for super::Device {
 
     unsafe fn create_compute_pipeline(
         &self,
-        desc: &crate::ComputePipelineDescriptor<super::Api>,
+        desc: &crate::ComputePipelineDescriptor<
+            super::PipelineLayout,
+            super::ShaderModule,
+            super::PipelineCache,
+        >,
     ) -> Result<super::ComputePipeline, crate::PipelineError> {
         let compiled = self.compile_stage(
             &desc.stage,
@@ -1980,7 +2062,7 @@ impl crate::Device for super::Device {
                 self.shared
                     .raw
                     .create_compute_pipelines(pipeline_cache, &vk_infos, None)
-                    .map_err(|(_, e)| crate::DeviceError::from(e))
+                    .map_err(|(_, e)| super::map_pipeline_err(e))
             }?
         };
 
@@ -2007,21 +2089,21 @@ impl crate::Device for super::Device {
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,
-    ) -> Result<PipelineCache, crate::PipelineCacheError> {
+    ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
         let mut info = vk::PipelineCacheCreateInfo::default();
         if let Some(data) = desc.data {
             info = info.initial_data(data)
         }
         profiling::scope!("vkCreatePipelineCache");
         let raw = unsafe { self.shared.raw.create_pipeline_cache(&info, None) }
-            .map_err(crate::DeviceError::from)?;
+            .map_err(super::map_host_device_oom_err)?;
 
-        Ok(PipelineCache { raw })
+        Ok(super::PipelineCache { raw })
     }
     fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
         Some(self.shared.pipeline_cache_validation_key)
     }
-    unsafe fn destroy_pipeline_cache(&self, cache: PipelineCache) {
+    unsafe fn destroy_pipeline_cache(&self, cache: super::PipelineCache) {
         unsafe { self.shared.raw.destroy_pipeline_cache(cache.raw, None) }
     }
     unsafe fn create_query_set(
@@ -2048,7 +2130,8 @@ impl crate::Device for super::Device {
             .query_count(desc.count)
             .pipeline_statistics(pipeline_statistics);
 
-        let raw = unsafe { self.shared.raw.create_query_pool(&vk_info, None) }?;
+        let raw = unsafe { self.shared.raw.create_query_pool(&vk_info, None) }
+            .map_err(super::map_host_device_oom_err)?;
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
         }
@@ -2071,7 +2154,8 @@ impl crate::Device for super::Device {
             let mut sem_type_info =
                 vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
             let vk_info = vk::SemaphoreCreateInfo::default().push_next(&mut sem_type_info);
-            let raw = unsafe { self.shared.raw.create_semaphore(&vk_info, None) }?;
+            let raw = unsafe { self.shared.raw.create_semaphore(&vk_info, None) }
+                .map_err(super::map_host_device_oom_err)?;
 
             super::Fence::TimelineSemaphore(raw)
         } else {
@@ -2152,14 +2236,14 @@ impl crate::Device for super::Device {
         }
     }
 
-    unsafe fn pipeline_cache_get_data(&self, cache: &PipelineCache) -> Option<Vec<u8>> {
+    unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
         let data = unsafe { self.raw_device().get_pipeline_cache_data(cache.raw) };
         data.ok()
     }
 
     unsafe fn get_acceleration_structure_build_sizes<'a>(
         &self,
-        desc: &crate::GetAccelerationStructureBuildSizesDescriptor<'a, super::Api>,
+        desc: &crate::GetAccelerationStructureBuildSizesDescriptor<'a, super::Buffer>,
     ) -> crate::AccelerationStructureBuildSizes {
         const CAPACITY: usize = 8;
 
@@ -2315,7 +2399,11 @@ impl crate::Device for super::Device {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         unsafe {
-            let raw_buffer = self.shared.raw.create_buffer(&vk_buffer_info, None)?;
+            let raw_buffer = self
+                .shared
+                .raw
+                .create_buffer(&vk_buffer_info, None)
+                .map_err(super::map_host_device_oom_and_ioca_err)?;
             let req = self.shared.raw.get_buffer_memory_requirements(raw_buffer);
 
             let block = self.mem_allocator.lock().alloc(
@@ -2330,7 +2418,8 @@ impl crate::Device for super::Device {
 
             self.shared
                 .raw
-                .bind_buffer_memory(raw_buffer, *block.memory(), block.offset())?;
+                .bind_buffer_memory(raw_buffer, *block.memory(), block.offset())
+                .map_err(super::map_host_device_oom_and_ioca_err)?;
 
             if let Some(label) = desc.label {
                 self.shared.set_object_name(raw_buffer, label);
@@ -2344,7 +2433,8 @@ impl crate::Device for super::Device {
 
             let raw_acceleration_structure = ray_tracing_functions
                 .acceleration_structure
-                .create_acceleration_structure(&vk_info, None)?;
+                .create_acceleration_structure(&vk_info, None)
+                .map_err(super::map_host_oom_and_ioca_err)?;
 
             if let Some(label) = desc.label {
                 self.shared
@@ -2397,7 +2487,7 @@ impl super::DeviceShared {
         unsafe {
             self.raw
                 .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .map_err(crate::DeviceError::from)
+                .map_err(super::map_host_device_oom_err)
         }
     }
 
@@ -2427,7 +2517,7 @@ impl super::DeviceShared {
                 match result {
                     Ok(()) => Ok(true),
                     Err(vk::Result::TIMEOUT) => Ok(false),
-                    Err(other) => Err(other.into()),
+                    Err(other) => Err(super::map_host_device_oom_and_lost_err(other)),
                 }
             }
             super::Fence::FencePool {
@@ -2443,12 +2533,13 @@ impl super::DeviceShared {
                             match unsafe { self.raw.wait_for_fences(&[raw], true, timeout_ns) } {
                                 Ok(()) => Ok(true),
                                 Err(vk::Result::TIMEOUT) => Ok(false),
-                                Err(other) => Err(other.into()),
+                                Err(other) => Err(super::map_host_device_oom_and_lost_err(other)),
                             }
                         }
                         None => {
-                            log::error!("No signals reached value {}", wait_value);
-                            Err(crate::DeviceError::Lost)
+                            crate::hal_usage_error(format!(
+                                "no signals reached value {wait_value}"
+                            ));
                         }
                     }
                 }
@@ -2461,11 +2552,8 @@ impl From<gpu_alloc::AllocationError> for crate::DeviceError {
     fn from(error: gpu_alloc::AllocationError) -> Self {
         use gpu_alloc::AllocationError as Ae;
         match error {
-            Ae::OutOfDeviceMemory | Ae::OutOfHostMemory => Self::OutOfMemory,
-            _ => {
-                log::error!("memory allocation: {:?}", error);
-                Self::Lost
-            }
+            Ae::OutOfDeviceMemory | Ae::OutOfHostMemory | Ae::TooManyObjects => Self::OutOfMemory,
+            Ae::NoCompatibleMemoryTypes => crate::hal_usage_error(error),
         }
     }
 }
@@ -2473,17 +2561,26 @@ impl From<gpu_alloc::MapError> for crate::DeviceError {
     fn from(error: gpu_alloc::MapError) -> Self {
         use gpu_alloc::MapError as Me;
         match error {
-            Me::OutOfDeviceMemory | Me::OutOfHostMemory => Self::OutOfMemory,
-            _ => {
-                log::error!("memory mapping: {:?}", error);
-                Self::Lost
-            }
+            Me::OutOfDeviceMemory | Me::OutOfHostMemory | Me::MapFailed => Self::OutOfMemory,
+            Me::NonHostVisible | Me::AlreadyMapped => crate::hal_usage_error(error),
         }
     }
 }
 impl From<gpu_descriptor::AllocationError> for crate::DeviceError {
     fn from(error: gpu_descriptor::AllocationError) -> Self {
-        log::error!("descriptor allocation: {:?}", error);
-        Self::OutOfMemory
+        use gpu_descriptor::AllocationError as Ae;
+        match error {
+            Ae::OutOfDeviceMemory | Ae::OutOfHostMemory | Ae::Fragmentation => Self::OutOfMemory,
+        }
     }
+}
+
+/// We usually map unexpected vulkan errors to the [`crate::DeviceError::Unexpected`]
+/// variant to be more robust even in cases where the driver is not
+/// complying with the spec.
+///
+/// However, we implement a few Trait methods that don't have an equivalent
+/// error variant. In those cases we use this function.
+fn handle_unexpected(err: vk::Result) -> ! {
+    panic!("Unexpected Vulkan error: `{err}`")
 }

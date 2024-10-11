@@ -1,3 +1,5 @@
+use std::mem::size_of_val;
+
 const ARR_SIZE: usize = 128;
 
 struct ExecuteResults {
@@ -54,20 +56,17 @@ async fn execute(
     let mut local_patient_workgroup_results = vec![0u32; result_vec_size];
     let mut local_hasty_workgroup_results = local_patient_workgroup_results.clone();
 
-    let shaders_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shaders.wgsl"))),
-    });
+    let shaders_module = device.create_shader_module(wgpu::include_wgsl!("shaders.wgsl"));
 
     let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: std::mem::size_of_val(local_patient_workgroup_results.as_slice()) as u64,
+        size: size_of_val(local_patient_workgroup_results.as_slice()) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: std::mem::size_of_val(local_patient_workgroup_results.as_slice()) as u64,
+        size: size_of_val(local_patient_workgroup_results.as_slice()) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -126,7 +125,7 @@ async fn execute(
             timestamp_writes: None,
         });
         compute_pass.set_pipeline(&patient_pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.set_bind_group(0, Some(&bind_group), &[]);
         compute_pass.dispatch_workgroups(local_patient_workgroup_results.len() as u32, 1, 1);
     }
     queue.submit(Some(command_encoder.finish()));
@@ -148,7 +147,7 @@ async fn execute(
             timestamp_writes: None,
         });
         compute_pass.set_pipeline(&hasty_pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.set_bind_group(0, Some(&bind_group), &[]);
         compute_pass.dispatch_workgroups(local_patient_workgroup_results.len() as u32, 1, 1);
     }
     queue.submit(Some(command_encoder.finish()));
@@ -182,7 +181,7 @@ async fn get_data<T: bytemuck::Pod>(
         0,
         staging_buffer,
         0,
-        std::mem::size_of_val(output) as u64,
+        size_of_val(output) as u64,
     );
     queue.submit(Some(command_encoder.finish()));
     let buffer_slice = staging_buffer.slice(..);
